@@ -6,6 +6,7 @@ v1.4.1
 - Major fps optimization when using the "stopped by X" feature on objects
 - Fixed the "stopped by X" feature not working with Auto-Bake
 - Fixed various issues when cloning levels	
+- Compatibility with the mod version checker from _Lib (GitHub release)
 
 v1.4.0
 - Shadow styles for Objects : "Offset" (default and current one), "Projected (Extrude)" and "Projected (Stretch)".
