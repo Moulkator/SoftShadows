@@ -1,0 +1,80 @@
+v1.4.1
+- Added undo/redo support
+- Added a "bake all" shadows option to render all shadows to a single overlay and gain fps
+- Included Shadow Overlays (paths, objects) into the "enable/disable" option in the Shadow Settings tool
+- Major fps optimization on multilevel maps
+- Major fps optimization when using the "stopped by X" feature on objects
+- Fixed the "stopped by X" feature not working with Auto-Bake
+- Fixed various issues when cloning levels	
+
+v1.4.0
+- Shadow styles for Objects : "Offset" (default and current one), "Projected (Extrude)" and "Projected (Stretch)".
+- Overlay Shadow for Objects (angle synced by default with the drop shadow angle of the same object)
+- Shadows hidden under the asset are not generated anymore (may help gaining some fps)
+
+v1.3.1
+- Fixed shadows being applied on selection after a reload
+- Fixed Soft Shadow button state not properly linked between the Object Tool and the Scatter Tool
+
+v1.3.0
+- Added radial offset for Paths ans Walls (offset following the drawing)
+- Added Side Balance for Paths and Walls (asymmetric shadow)
+- Added of a Shadows toggle button in the bottom floatbar (hides/displays shadows, only visual, no impact on memory usage)
+- Fixed RAM issue when loading a map with lots of assets
+- Added a button to Enable/Disable shadows per level in the Level Settings tool (disable = less memory usage)
+- Added a Soft Shadow tool in the Effects Tab (under Lights):
+	- Enable/Disable for All Levels/Current Level/Other Levels
+	- Quality setting for all object shadows
+	- Rendering options (Live, Bake Auto, Bake Manual)
+- Removed the quality option in the Selection Tool
+
+
+v1.2.2 Hotfix
+- Works with the Resize Left Panel mod from uchideshi34
+- Attempt to fix crashes when using the object tool with the shadow activated (tell me if that's not working)
+
+v1.2.1 Hotfix
+- Works with the Change Object Texture mod from uchideshi34
+
+v1.2.0
+- Optimized shadow rendering (kudos to uchideshi34 for his help)
+- Shadow quality slider for lower GPU usage (+ "apply to all" toggle button)
+- Fixed bug: "Shadow Behind Layer" didn't work at export and was actually over everything
+- "Shadow Behind Layer" button for paths
+- Lock button in the Objects Tool is now greyed out instead of hidden when the user didn't set new Default Values.
+- Rework of the Walls and paths "Extend Ends" feature. Now wraps around the corner (rounded line cap) 
+- Beta version of Roof Shadows (no dormer support and limited hip support)
+	
+v1.1.4 Hotfix 4
+- Fixed Extend Ends for portals on looped walls not being saved on fresh reload
+- Moved the Extend Ends button lower in the list to avoid weird UI changes
+- Moved the Soft Shadow button up in the Wall Tool to be under the vanilla Shadow button instead of at the bottom of the tool
+- Extend Ends setting kept in memory on looped walls when toggling on/off/on Skip Portals
+- Below All Walls now works with the Hide Layers mod
+- Fixed Below All Walls shadows staying on the map when their walls were deleted
+
+v1.1.3 Hotfix 3
+- Fixed toggle by default on the portal (switch was always on but didn't actually work the first time)
+- Fixed saving not keeping the correct setting for skip portals and extend ends (or at least part of it)
+- Fixed copy buttons
+- Fixed first asset placed on the map not not having shadows after a reload
+
+v1.1.2 Hotfix 2
+- Fixed "Below all walls" not being displayed on the correct layer
+- Changing a setting in a multiselection now only affects the setting itself and not the whole selection
+- New "Selected assets" option added to "Apply to all" button
+
+v1.1.1 Hotfix
+- Fixed wall shadows being randomly hidden after a texture change
+- Fixed wrong mirroring for objects and paths
+- Fixed enabling options on a path causing the path to be deselected
+- Fixed shadow rotation lag in the object tool
+- Fixed placed objects without shadows having the button mistoggled in the selection tool (not sure if that was a 1.1.0 bug or something that happened in between tbh)
+
+
+v1.1.0 
+- Offset settings consistency (same in the object tool, wall tool and path tool)
+- New toggle option for wall shadows: Below All Walls ON/OFF
+- Better copy for paths
+- Switch Wall Shadow setting hidden for portals on wallls that have no shadow
+- More options in "Apply to all": All Layers, Current Layers, Filtered Layers (works for paths and objects)
