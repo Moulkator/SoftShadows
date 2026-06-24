@@ -1,4 +1,4 @@
-v1.4.1
+v1.4.1 - Github + Cartography Assets Release
 - Added undo/redo support
 - Added a "bake all" shadows option to render all shadows to a single overlay and gain fps
 - Included Shadow Overlays (paths, objects) into the "enable/disable" option in the Shadow Settings tool
@@ -72,8 +72,7 @@ v1.1.1 Hotfix
 - Fixed shadow rotation lag in the object tool
 - Fixed placed objects without shadows having the button mistoggled in the selection tool (not sure if that was a 1.1.0 bug or something that happened in between tbh)
 
-
-v1.1.0 
+v1.1.0 - Discord Release
 - Offset settings consistency (same in the object tool, wall tool and path tool)
 - New toggle option for wall shadows: Below All Walls ON/OFF
 - Better copy for paths
