@@ -321,13 +321,6 @@ func start() -> void:
 	# Register with _lib if available
 	if Engine.has_signal("_lib_register_mod"):
 		Engine.emit_signal("_lib_register_mod", self)
-		# Branche le verificateur de mise a jour de _Lib (si cette version le fournit)
-		if "API" in Global and Global.API.has("UpdateChecker"):
-			var uc = Global.API.UpdateChecker
-			uc.register(uc.builder()\
-				.fetcher(uc.github_fetcher("Moulkator", "SoftShadows"))\
-				.downloader(uc.github_downloader("Moulkator", "SoftShadows"))\
-				.build())
 
 	# Initialise the drop shadow system
 	initialise_dropshadow()

@@ -2,7 +2,7 @@ shader_type canvas_item;
 
 uniform vec4 shadow_color : hint_color = vec4(0.0, 0.0, 0.0, 1.0);
 uniform float shadow_strength : hint_range(0.0, 5.0) = 1.0;
-uniform float vertex_scale : hint_range(1.0, 8.0) = 2.0;
+uniform vec2 vertex_scale_xy = vec2(2.0, 2.0);
 uniform float blur_radius : hint_range(0.0, 120.0, 0.5) = 10.0;
 uniform float spread : hint_range(0.0, 1.0) = 0.0;
 
@@ -40,12 +40,12 @@ uniform vec4 poly_def7 = vec4(0.0);
 
 
 
-varying float v_scale;
+varying vec2 v_scale;
 varying vec2 v_scaled_vertex;
 
 void vertex() {
-    v_scale = vertex_scale;
-    VERTEX *= mat2(vec2(v_scale, 0.0), vec2(0.0, v_scale));
+    v_scale = vertex_scale_xy;
+    VERTEX *= mat2(vec2(v_scale.x, 0.0), vec2(0.0, v_scale.y));
     v_scaled_vertex = VERTEX;
 }
 
@@ -120,20 +120,22 @@ float check_polyline(vec2 world_pos, vec4 def, int normal_start) {
 // point if the silhouette covers any point back along -proj_dir within length,
 // with a per-distance fade. Side edges of the swept tail are parallel to the
 // light direction, which is what a real cast shadow does (clean on boxes).
-const int EXTRUDE_STEPS = 18;
+uniform int extrude_steps = 18;
 float src_alpha(sampler2D tex, vec2 p) {
     float m = 0.0;
     if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) {
         m = texture(tex, p).a;
     }
     if (proj_enabled > 0.5 && proj_extrude > 0.5 && proj_length > 0.01) {
+        float fsteps = float(extrude_steps);
         float total_px = proj_length * max(proj_tex_size.x, proj_tex_size.y);
-        float step_px = total_px / float(EXTRUDE_STEPS);
+        float step_px = total_px / fsteps;
         vec2 duv = (proj_dir * step_px) / proj_tex_size;
-        for (int s = 1; s <= EXTRUDE_STEPS; s++) {
+        for (int s = 1; s <= 64; s++) {
+            if (s > extrude_steps) break;
             vec2 q = p - duv * float(s);
             if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
-                float w = 1.0 - proj_fade * (float(s) / float(EXTRUDE_STEPS));
+                float w = 1.0 - proj_fade * (float(s) / fsteps);
                 m = max(m, texture(tex, q).a * w);
             }
         }
@@ -166,7 +168,7 @@ void fragment() {
     }
 
     vec2 uv = UV * v_scale;
-    uv -= (v_scale - 1.0) / 2.0;
+    uv -= (v_scale - vec2(1.0)) * 0.5;
 
     // Discard the shadow under the asset (it would be hidden anyway, and this keeps
     // it from showing through transparent parts of the asset). The mask is eroded

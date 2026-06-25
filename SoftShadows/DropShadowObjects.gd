@@ -39,6 +39,23 @@ const BAKE_MODE_MANUAL = 2
 # ModMapData key for the quality-broadcast persistence (toggle state + snapshot
 # of pre-broadcast quality values). Survives map save/load and DD restart.
 const BROADCAST_DATA_KEY = "DropShadowQualityBroadcast"
+
+# --- Projected-shadow quad sizing & extrude optimisation (tunable) ---
+# Max half-extent (px from center) a projected shadow quad is allowed to reach on
+# each LOCAL axis. Caps fragment count / bake viewport for very long shadows; the
+# tip truncates beyond this. 2048 px ≈ 8 tiles at 256 px/tile.
+const MAX_PROJ_HALF_PX = 2048.0
+# Extrude sweep: target spacing between sweep samples (px). Smaller = smoother but
+# more samples. Steps are derived from sweep length / this, then clamped below.
+const EXTRUDE_STEP_TARGET_PX = 8.0
+const EXTRUDE_STEPS_MIN = 8
+const EXTRUDE_STEPS_MAX = 40
+# In extrude mode the directional sweep already fills the body, so the per-fragment
+# ring blur (which multiplies the sweep cost) is capped lower than in offset/stretch
+# mode. Raise these if extrude edges look too hard.
+const EXTRUDE_BLUR_QUALITY_MAX = 4
+const EXTRUDE_BLUR_STEPS_MAX = 10
+
 # ModMapData key for the quality lock toggle (true = slider snaps to tier values
 # 25/50/75/100, false = free fine-tune 0..100). Default true.
 const LOCK_STATE_KEY = "DropShadowQualityLock"
@@ -226,7 +243,7 @@ void fragment() {
 	if global.World.has_signal("OnAssignNode"):
 		global.World.connect("OnAssignNode", self, "_on_new_node_added")
 
-	outputlog("Drop Shadow Objects initialised. (v2-ctrlcv)", 0)
+	outputlog("Drop Shadow Objects initialised. [BUILD: proj-live-peraxis]", 0)
 
 
 #########################################################################################################
@@ -597,21 +614,20 @@ func create_shadow(obj, config: Dictionary):
 	var blur_quality = max(int(clamp(shader_blur / 3.0, 4, 16) * quality_factor), 2)
 	var blur_steps = max(int(clamp(shader_blur * 0.9, 16, 48) * quality_factor), 8)
 
-	# vertex_scale: needs to cover the full blur area in world space
-	# blur_ratio compensates for the capped shader_blur
-	# Use min_dim so flat/thin objects get enough expansion on their short axis
+	# Per-axis quad expansion: in projected mode each LOCAL axis is grown only as
+	# far as the cast shadow reaches on it (so a thin asset projected across its
+	# short axis gets a slim quad, not a huge square). Offset mode stays symmetric.
+	var vsxy = _compute_vertex_scale_xy(obj, config, tex_size, shader_blur, blur_ratio)
+
+	# Extrude optimisation: the directional sweep already fills the body, so cap the
+	# (multiplicative) ring blur and derive the sweep step count from the length.
 	var max_dim = max(tex_size.x, tex_size.y)
-	var min_dim = min(tex_size.x, tex_size.y)
-	# For very flat assets (e.g. 512x32), the shadow bleeds much further
-	# relative to the short axis — use min_dim to size the expansion
-	var effective_dim = max(min_dim, max_dim * 0.25)  # never smaller than 25% of max
-	var vertex_scale = 1.0 + (shader_blur * blur_ratio * 2.5) / effective_dim + 0.5
-	vertex_scale = clamp(vertex_scale, 1.5, 8.0)
-	# Projected mode: the cast shadow extends well past the normal blur expansion,
-	# so the rendered quad must be large enough to contain it (else the tip clips).
-	if projected:
-		var needed_vs = 2.0 + config.get("proj_length", 0.0) + 1.0
-		vertex_scale = clamp(max(vertex_scale, needed_vs), 1.5, 12.0)
+	var extrude_steps = 18
+	if projected and float(config.get("proj_extrude", 0.0)) > 0.5:
+		var sweep_px = float(config.get("proj_length", 0.0)) * max_dim
+		extrude_steps = int(clamp(ceil(sweep_px / EXTRUDE_STEP_TARGET_PX), EXTRUDE_STEPS_MIN, EXTRUDE_STEPS_MAX))
+		blur_quality = int(clamp(blur_quality, 2, EXTRUDE_BLUR_QUALITY_MAX))
+		blur_steps = int(clamp(blur_steps, 6, EXTRUDE_BLUR_STEPS_MAX))
 
 	# Duplicate the sprite — NO scale change ever
 	var shadow_sprite = sprite.duplicate(0)
@@ -626,7 +642,8 @@ func create_shadow(obj, config: Dictionary):
 	mat.set_shader_param("shadow_strength", opacity_val * energy_comp)
 	mat.set_shader_param("blur_quality", blur_quality)
 	mat.set_shader_param("blur_steps", blur_steps)
-	mat.set_shader_param("vertex_scale", vertex_scale)
+	mat.set_shader_param("vertex_scale_xy", vsxy)
+	mat.set_shader_param("extrude_steps", extrude_steps)
 	_apply_projection_params(mat, obj, config, sprite, tex_size)
 	shadow_sprite.material = mat
 
@@ -660,7 +677,10 @@ func create_shadow(obj, config: Dictionary):
 	obj.move_child(shadow_sprite, 0)
 
 	# Expand the custom rect so the shader-expanded shadow isn't clipped
-	_update_custom_rect(obj, sprite, total_blur, vertex_scale)
+	_update_custom_rect(obj, sprite, total_blur, max(vsxy.x, vsxy.y))
+	# Same expansion on the shadow sprite's OWN canvas item (per-axis), so it isn't
+	# culled at chunked export when the source sprite falls outside the current chunk.
+	_set_shadow_sprite_custom_rect(shadow_sprite, vsxy)
 
 	obj.set_meta(SHADOW_META_KEY, [shadow_sprite])
 
@@ -678,11 +698,60 @@ func create_shadow(obj, config: Dictionary):
 	# actually placed yet (user is just scrolling the asset list or moving the
 	# cursor). _obj_tool_preview_node is set to `obj` just before this function
 	# is called for the preview, in _on_monitor_tick.
+	# Projected shadows stay LIVE: after the per-axis + extrude optimisation the
+	# live shader is cheap, whereas baking a projected shadow needs a large texture
+	# (long cast = big rectangle) → heavy VRAM/bandwidth at rest and fragile viewport
+	# capture. Only offset shadows auto-bake.
 	if config.get("shadow_mode", "offset") == "projected":
 		if _bake_debounce != null:
 			_bake_debounce.cancel(obj)
 	elif obj != _obj_tool_preview_node and _should_auto_bake():
 		_bake_debounce.schedule_bake(obj)
+
+func _compute_vertex_scale_xy(obj, config: Dictionary, tex_size: Vector2, shader_blur: float, blur_ratio: float) -> Vector2:
+	# Returns the per-axis quad expansion (local x, y). Offset mode keeps the old
+	# symmetric scale. Projected mode grows each LOCAL axis only as far as the cast
+	# shadow actually reaches on it, so a thin asset projected ACROSS its short axis
+	# gets a slim quad instead of a huge uniform square (which both clipped on the
+	# short axis and exploded the fragment count / bake viewport on the long one).
+	var max_dim = max(tex_size.x, tex_size.y)
+	var min_dim = min(tex_size.x, tex_size.y)
+	var effective_dim = max(min_dim, max_dim * 0.25)
+	var base_vs = clamp(1.0 + (shader_blur * blur_ratio * 2.5) / effective_dim + 0.5, 1.5, 8.0)
+	if config.get("shadow_mode", "offset") != "projected":
+		return Vector2(base_vs, base_vs)
+
+	# Cast direction in LOCAL space (follows the light, not the asset rotation).
+	var ang = config.get("proj_angle", 0.0)
+	var wdir = Vector2(cos(ang), sin(ang))
+	var ldir = obj.global_transform.affine_inverse().basis_xform(wdir)
+	ldir = ldir.normalized() if ldir.length() > 0.0001 else Vector2(0.0, 1.0)
+	var adx = abs(ldir.x)
+	var ady = abs(ldir.y)
+
+	var proj_length = float(config.get("proj_length", 0.0))
+	var taper = float(config.get("proj_taper", 0.0))
+	var hx = tex_size.x * 0.5
+	var hy = tex_size.y * 0.5
+	# Silhouette half-extents along the cast direction and perpendicular to it
+	# (AABB projection of the texture half-size onto dir / perp).
+	var sil_along = hx * adx + hy * ady
+	var sil_perp = hx * ady + hy * adx
+	# Cast geometry from center: body extends sil_along + the projection length;
+	# perp width grows when taper widens the tail (taper < 0).
+	var h_along = sil_along + proj_length * max_dim
+	var h_perp = sil_perp * (1.0 + clamp(-taper, 0.0, 1.0))
+	var blur_margin = shader_blur * blur_ratio * 1.5
+	# Rotate the (h_along × h_perp) box into local axes, take AABB half-extents,
+	# add the isotropic blur margin. perp = (-ldir.y, ldir.x).
+	var half_x = h_along * adx + h_perp * ady + blur_margin
+	var half_y = h_along * ady + h_perp * adx + blur_margin
+	# Cap absolute px reach (fragment count + bake viewport). Floor at the silhouette.
+	half_x = clamp(half_x, tex_size.x * 0.75, MAX_PROJ_HALF_PX)
+	half_y = clamp(half_y, tex_size.y * 0.75, MAX_PROJ_HALF_PX)
+	var vsx = max(2.0 * half_x / max(tex_size.x, 1.0), 1.5)
+	var vsy = max(2.0 * half_y / max(tex_size.y, 1.0), 1.5)
+	return Vector2(vsx, vsy)
 
 func _update_custom_rect(obj, sprite, blur_px: float, vertex_scale: float):
 	if sprite == null or sprite.texture == null:
@@ -725,6 +794,36 @@ func _update_custom_rect(obj, sprite, blur_px: float, vertex_scale: float):
 	expanded.size = tex_rect.size + Vector2(expand_x * 2.0, expand_y * 2.0)
 	VisualServer.canvas_item_set_custom_rect(obj.get_canvas_item(), true, expanded)
 
+func _set_shadow_sprite_custom_rect(shadow_sprite, vertex_scale_xy: Vector2) -> void:
+	# Le culling 2D de Godot teste chaque CanvasItem selon SON propre rect : un
+	# parent culé n'entraîne pas ses enfants, et un custom_rect posé sur le Prop
+	# (obj) ne protège donc pas le sprite enfant qui dessine réellement l'ombre.
+	# L'agrandissement (per-axis) est fait dans le vertex() du shader, donc invisible
+	# pour le culling CPU. À l'export chunké (Exporter.cs déplace la caméra chunk par
+	# chunk), si le centre du sprite source tombe hors du chunk courant, le
+	# shadow_sprite est culé entièrement et la pointe de l'ombre disparaît. On force
+	# ici un custom_rect couvrant tout le quad scalé, par axe.
+	if shadow_sprite == null or not is_instance_valid(shadow_sprite):
+		return
+	if shadow_sprite.texture == null:
+		return
+	var ts = shadow_sprite.texture.get_size()
+	if shadow_sprite.region_enabled:
+		ts = shadow_sprite.region_rect.size
+	if ts.x < 1.0 or ts.y < 1.0:
+		return
+	# Rect du quad en coords LOCALES px (pré-transform), comme VERTEX. Le shader
+	# scale VERTEX autour de l'origine locale (0,0), par axe. L'offset/position et
+	# le scale du sprite sont appliqués ensuite par sa Transform2D, comme VERTEX.
+	var base_pos = shadow_sprite.offset
+	if shadow_sprite.centered:
+		base_pos = base_pos - ts * 0.5
+	var rect = Rect2(
+		Vector2(base_pos.x * vertex_scale_xy.x, base_pos.y * vertex_scale_xy.y),
+		Vector2(ts.x * vertex_scale_xy.x, ts.y * vertex_scale_xy.y)
+	)
+	VisualServer.canvas_item_set_custom_rect(shadow_sprite.get_canvas_item(), true, rect)
+
 #########################################################################################################
 ##
 ## WALL / PATH CLIPPING
@@ -744,9 +843,10 @@ func _apply_clip_mask(obj, shadow_sprite, config: Dictionary):
 		var tex_size = shadow_sprite.texture.get_size()
 		var mat = shadow_sprite.material as ShaderMaterial
 		if mat != null:
-			var vs = mat.get_shader_param("vertex_scale")
-			if vs != null and vs > 0:
-				shadow_radius = max(tex_size.x, tex_size.y) * vs * shadow_sprite.global_scale.x * 0.5
+			var vs = mat.get_shader_param("vertex_scale_xy")
+			var vsf = max(vs.x, vs.y) if vs is Vector2 else (float(vs) if vs != null else 0.0)
+			if vsf > 0:
+				shadow_radius = max(tex_size.x, tex_size.y) * vsf * shadow_sprite.global_scale.x * 0.5
 	shadow_radius += offset.length()
 
 	var polylines = _collect_clip_polylines(obj, clip_walls, clip_paths, shadow_radius, shadow_center)
@@ -1382,9 +1482,10 @@ func _update_clip_planes(obj, shadow_sprite, config: Dictionary):
 		var tex_size = shadow_sprite.texture.get_size()
 		var mat2 = shadow_sprite.material as ShaderMaterial
 		if mat2 != null:
-			var vs = mat2.get_shader_param("vertex_scale")
-			if vs != null and vs > 0:
-				shadow_radius = max(tex_size.x, tex_size.y) * vs * shadow_sprite.global_scale.x * 0.5
+			var vs = mat2.get_shader_param("vertex_scale_xy")
+			var vsf = max(vs.x, vs.y) if vs is Vector2 else (float(vs) if vs != null else 0.0)
+			if vsf > 0:
+				shadow_radius = max(tex_size.x, tex_size.y) * vsf * shadow_sprite.global_scale.x * 0.5
 	shadow_radius += offset.length()
 
 	var polylines = _collect_clip_polylines(obj, clip_walls, clip_paths, shadow_radius, shadow_center)
@@ -1449,8 +1550,8 @@ func bake_object_now(obj):
 		return
 	if _baker_script.is_baked(obj, SHADOW_META_KEY):
 		return
-	# Never bake projected shadows — the bake viewport clips the projection,
-	# collapsing the cast shadow into a centred blob. Keep them as live shaders.
+	# Projected shadows stay live (baking them is a VRAM/capture problem — see
+	# create_shadow). Never bake them, even on an explicit manual bake.
 	if obj.has_meta("_shadow_config"):
 		var bccfg = obj.get_meta("_shadow_config")
 		if bccfg is Dictionary and bccfg.get("shadow_mode", "offset") == "projected":
@@ -1489,7 +1590,7 @@ func bake_objects_sequential(obj_list):
 	for obj in obj_list:
 		if obj == null or not is_instance_valid(obj):
 			continue
-		# Skip projected shadows — they must stay live shaders (the bake clips them).
+		# Projected shadows stay live — never queue them for baking.
 		if obj.has_meta("_shadow_config"):
 			var qccfg = obj.get_meta("_shadow_config")
 			if qccfg is Dictionary and qccfg.get("shadow_mode", "offset") == "projected":
@@ -1573,13 +1674,16 @@ func _fast_update_shadow(obj, config: Dictionary) -> bool:
 	var blur_quality = max(int(clamp(shader_blur / 3.0, 4, 16) * quality_factor), 2)
 	var blur_steps = max(int(clamp(shader_blur * 0.9, 16, 48) * quality_factor), 8)
 
-	var min_dim = min(tex_size.x, tex_size.y)
-	var effective_dim = max(min_dim, max_dim * 0.25)
-	var vertex_scale = 1.0 + (shader_blur * blur_ratio * 2.5) / effective_dim + 0.5
-	vertex_scale = clamp(vertex_scale, 1.5, 8.0)
-	if projected:
-		var needed_vs = 2.0 + config.get("proj_length", 0.0) + 1.0
-		vertex_scale = clamp(max(vertex_scale, needed_vs), 1.5, 12.0)
+	# Per-axis quad expansion (see _compute_vertex_scale_xy / create_shadow).
+	var vsxy = _compute_vertex_scale_xy(obj, config, tex_size, shader_blur, blur_ratio)
+
+	# Extrude optimisation — mirror create_shadow.
+	var extrude_steps = 18
+	if projected and float(config.get("proj_extrude", 0.0)) > 0.5:
+		var sweep_px = float(config.get("proj_length", 0.0)) * max_dim
+		extrude_steps = int(clamp(ceil(sweep_px / EXTRUDE_STEP_TARGET_PX), EXTRUDE_STEPS_MIN, EXTRUDE_STEPS_MAX))
+		blur_quality = int(clamp(blur_quality, 2, EXTRUDE_BLUR_QUALITY_MAX))
+		blur_steps = int(clamp(blur_steps, 6, EXTRUDE_BLUR_STEPS_MAX))
 
 	var local_offset = _world_to_local_offset(obj, offset)
 	var behind_layer = config.get("behind_layer", false)
@@ -1595,7 +1699,8 @@ func _fast_update_shadow(obj, config: Dictionary) -> bool:
 			mat.set_shader_param("shadow_strength", opacity_val * energy_comp)
 			mat.set_shader_param("blur_quality", blur_quality)
 			mat.set_shader_param("blur_steps", blur_steps)
-			mat.set_shader_param("vertex_scale", vertex_scale)
+			mat.set_shader_param("vertex_scale_xy", vsxy)
+			mat.set_shader_param("extrude_steps", extrude_steps)
 			_apply_projection_params(mat, obj, config, sprite, tex_size)
 			mat.set_shader_param("cut_offset", Vector2.ZERO if projected else Vector2(local_offset.x / tex_size.x, local_offset.y / tex_size.y))
 			# Shadow stays as a child of obj. behind_layer just toggles relative
@@ -1605,14 +1710,16 @@ func _fast_update_shadow(obj, config: Dictionary) -> bool:
 			node.z_index = -1 if behind_layer else 0
 			node.scale = sprite.scale
 			node.position = sprite.position + local_offset
+			# Keep the shadow sprite's own per-axis cull rect in sync so it isn't
+			# culled at chunked export (see _set_shadow_sprite_custom_rect).
+			_set_shadow_sprite_custom_rect(node, vsxy)
 
 	obj.set_meta("_shadow_offset", offset)
 	obj.set_meta("_shadow_config", config)
-	_update_custom_rect(obj, sprite, total_blur, vertex_scale)
+	_update_custom_rect(obj, sprite, total_blur, max(vsxy.x, vsxy.y))
 	save_shadow_data(obj, config)
-	# Never bake projected shadows (the bake viewport clips the projection). When
-	# switching INTO a projected mode, cancel any bake still pending from offset so
-	# it can't fire later and install a clipped, wrong-shaped bake.
+	# Projected shadows stay live (see create_shadow). Switching INTO projected
+	# cancels any bake still pending from offset; only offset auto-bakes.
 	if config.get("shadow_mode", "offset") == "projected":
 		if _bake_debounce != null:
 			_bake_debounce.cancel(obj)
@@ -2001,6 +2108,7 @@ func _update_all_shadow_rotations():
 		# The shadow sprite is a child of the (rotating) asset, so re-derive the
 		# local proj_dir from the world angle every frame — rotating the asset then
 		# leaves the shadow pointing the same way in the world (like offset does).
+		# Projected shadows always stay live, so this just updates the shader param.
 		if obj.has_meta("_shadow_config"):
 			var pcfg = obj.get_meta("_shadow_config")
 			if pcfg is Dictionary and pcfg.get("shadow_mode", "offset") == "projected":

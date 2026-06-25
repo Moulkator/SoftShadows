@@ -26,6 +26,10 @@ extends Reference
 
 
 const DEBOUNCE_MS := 1500
+# Verbose bake logging. false = silent (default). Flip to true to trace the bake
+# lifecycle (timer fire, viewport build, extract, complete) in the console.
+const BAKE_DIAG := false
+
 # Viewports this large still work fine on any modern GPU. Cap exists to prevent
 # runaway memory for props with extreme vertex_scale. 8192 = 256MB at RGBA8.
 const MAX_BAKE_DIMENSION := 8192
@@ -38,28 +42,19 @@ const SHADER_PARAMS = [
 	"shadow_strength",
 	"blur_quality",
 	"blur_steps",
-	"vertex_scale",
+	"vertex_scale_xy",
+	"extrude_steps",
 	"cut_offset",
-	# Clip uniforms — copied so the bake reproduces the wall/path clipping
-	# instead of a flat, unclipped shadow. (vertex_to_world() in the shader
-	# reconstructs world pos from these, independent of the render node's
-	# transform, so baking at viewport-center still yields the correct mask.)
-	"sprite_world_pos",
-	"sprite_world_rot",
-	"sprite_world_scale",
-	"obj_world_pos",
-	"shadow_clip_radius",
-	"poly_data_tex",
-	"poly_data_size",
-	"poly_count",
-	"poly_def0",
-	"poly_def1",
-	"poly_def2",
-	"poly_def3",
-	"poly_def4",
-	"poly_def5",
-	"poly_def6",
-	"poly_def7",
+	# Projected (cast) shadow params — MUST be copied or the bake renders the
+	# silhouette with proj_enabled=0 (a centred blob) instead of the cast shadow.
+	"proj_enabled",
+	"proj_dir",
+	"proj_length",
+	"proj_anchor",
+	"proj_taper",
+	"proj_tex_size",
+	"proj_fade",
+	"proj_extrude",
 ]
 
 # Meta key set on a shadow Sprite after it's been baked. Used so _fast_update_shadow
@@ -102,9 +97,20 @@ static func bake_shadow(shadow_sprite: Sprite, source_sprite: Sprite, global, mo
 		_dbg(mod, "bake: shadow_sprite has no ShaderMaterial, abort")
 		return null
 
-	var vertex_scale: float = float(mat.get_shader_param("vertex_scale"))
-	if vertex_scale <= 0.0:
-		vertex_scale = 1.0
+	# Per-axis quad scale. Falls back to a legacy scalar "vertex_scale" param if a
+	# shadow built by an older module version is somehow still around.
+	var vsxy: Vector2 = Vector2.ONE
+	var vsxy_param = mat.get_shader_param("vertex_scale_xy")
+	if vsxy_param is Vector2:
+		vsxy = vsxy_param
+	else:
+		var legacy = mat.get_shader_param("vertex_scale")
+		var lf = float(legacy) if legacy != null else 1.0
+		vsxy = Vector2(lf, lf)
+	if vsxy.x <= 0.0:
+		vsxy.x = 1.0
+	if vsxy.y <= 0.0:
+		vsxy.y = 1.0
 
 	var tex: Texture = source_sprite.texture
 	var tex_size: Vector2 = tex.get_size()
@@ -115,14 +121,14 @@ static func bake_shadow(shadow_sprite: Sprite, source_sprite: Sprite, global, mo
 		return null
 
 	var viewport_size := Vector2(
-		ceil(tex_size.x * vertex_scale),
-		ceil(tex_size.y * vertex_scale)
+		ceil(tex_size.x * vsxy.x),
+		ceil(tex_size.y * vsxy.y)
 	)
 	if viewport_size.x > MAX_BAKE_DIMENSION or viewport_size.y > MAX_BAKE_DIMENSION:
 		_dbg(mod, "bake: viewport too large %s, abort" % viewport_size)
 		return null
 
-	_dbg(mod, "bake: begin tex=%s vs=%.2f vp=%s" % [tex_size, vertex_scale, viewport_size])
+	_dbg(mod, "bake: begin tex=%s vs=%s vp=%s" % [tex_size, vsxy, viewport_size])
 	var tree := global.Editor.get_tree()
 
 	var viewport := _build_viewport(viewport_size)
@@ -145,10 +151,6 @@ static func bake_shadow(shadow_sprite: Sprite, source_sprite: Sprite, global, mo
 	_dbg(mod, "bake: complete, baked=%s" % ("valid" if baked != null else "null"))
 	return baked
 
-
-# Set true to re-enable the verbose per-step bake logging (begin/extract/
-# complete). Off by default so auto-bake passes don't flood the console.
-const BAKE_DIAG := false
 
 static func _dbg(mod, msg: String) -> void:
 	if not BAKE_DIAG:
@@ -272,10 +274,9 @@ static func _build_render_sprite(source_sprite: Sprite, viewport_size: Vector2,
 		var v = source_mat.get_shader_param(p)
 		if v != null:
 			mat.set_shader_param(p, v)
-	# NOTE: clip params (poly_count/poly_def*/poly_data_tex/...) are copied via
-	# SHADER_PARAMS above, so the viewport bakes the CLIPPED shadow. The mask is
-	# burned into the texture; if walls/paths move afterwards the debounce
-	# manager rebakes.
+	# Zero clip params — the baked image is the unclipped shadow. Clipped props
+	# rebake on position change via the debounce manager.
+	mat.set_shader_param("poly_count", 0)
 	s.material = mat
 	return s
 
@@ -348,6 +349,10 @@ static func _extract_sprite(viewport: Viewport, shadow_sprite: Sprite, mod = nul
 
 class DebounceManager extends Reference:
 
+	# Mirror of the outer ShadowBaker.BAKE_DIAG (nested classes can't read the outer
+	# const). Keep both in sync; false = silent (default).
+	const BAKE_DIAG := false
+
 	var _mod                 # the DropShadowObjects instance; needs .global and .get_sprite()
 	var _shadow_meta_key: String
 	var _baker               # the outer ShadowBaker script (so we can call its statics)
@@ -413,6 +418,9 @@ class DebounceManager extends Reference:
 		_obj_refs.erase(iid)
 
 	func _on_timer_fired(iid: int) -> void:
+		if BAKE_DIAG and _mod != null and _mod.has_method("outputlog"):
+			_mod.outputlog("ShadowBaker: timer fired for iid=%d" % iid, 0)
+
 		# Pull the obj out via weakref BEFORE cleanup — _cancel_by_id erases _obj_refs.
 		var obj = null
 		if _obj_refs.has(iid):
@@ -420,6 +428,8 @@ class DebounceManager extends Reference:
 		_cancel_by_id(iid)
 
 		if obj == null or not is_instance_valid(obj):
+			if BAKE_DIAG and _mod != null and _mod.has_method("outputlog"):
+				_mod.outputlog("ShadowBaker: obj freed before timer fire, skip", 0)
 			return
 		if not obj.has_meta(_shadow_meta_key):
 			return
@@ -433,9 +443,9 @@ class DebounceManager extends Reference:
 		if shadow_sprite.has_meta(META_BAKED):
 			return
 
-		# Never bake a projected shadow: the bake viewport clips the projection,
-		# which would install a wrong-shaped texture. (Mode may have changed since
-		# the bake was scheduled, e.g. offset -> projected.)
+		# Projected shadows stay live (large textures = VRAM cost + fragile viewport
+		# capture). DropShadowObjects never queues them, this is defense-in-depth in
+		# case a mode switch left a stale timer pending.
 		if obj.has_meta("_shadow_config"):
 			var cfg = obj.get_meta("_shadow_config")
 			if cfg is Dictionary and cfg.get("shadow_mode", "offset") == "projected":
@@ -451,12 +461,6 @@ class DebounceManager extends Reference:
 		if not is_instance_valid(obj) or not is_instance_valid(shadow_sprite):
 			baked.queue_free()
 			return
-		# Mode may have switched to projected during the bake — don't install.
-		if obj.has_meta("_shadow_config"):
-			var cfg2 = obj.get_meta("_shadow_config")
-			if cfg2 is Dictionary and cfg2.get("shadow_mode", "offset") == "projected":
-				baked.queue_free()
-				return
 		# If schedule_bake was called again during the bake, a fresh timer will be
 		# pending — skip install and let the next fire do it.
 		if _timers.has(obj.get_instance_id()):

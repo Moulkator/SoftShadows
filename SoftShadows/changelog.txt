@@ -1,12 +1,16 @@
-v1.4.1 - Github + Cartography Assets Release
+v1.4.2
+- Optimized and improved "Extrude" shadows
+- Fixed long shadows being cropped at export in high res
+
+v1.4.1 - GitHub & Cartography Assets Release
 - Added undo/redo support
 - Added a "bake all" shadows option to render all shadows to a single overlay and gain fps
 - Included Shadow Overlays (paths, objects) into the "enable/disable" option in the Shadow Settings tool
 - Major fps optimization on multilevel maps
 - Major fps optimization when using the "stopped by X" feature on objects
 - Fixed the "stopped by X" feature not working with Auto-Bake
-- Fixed various issues when cloning levels	
-- Compatibility with the mod version checker from _Lib (GitHub release)
+- Fixed various issues when cloning levels
+- Compatibility with the mod version checker from _Lib
 
 v1.4.0
 - Shadow styles for Objects : "Offset" (default and current one), "Projected (Extrude)" and "Projected (Stretch)".
@@ -72,7 +76,8 @@ v1.1.1 Hotfix
 - Fixed shadow rotation lag in the object tool
 - Fixed placed objects without shadows having the button mistoggled in the selection tool (not sure if that was a 1.1.0 bug or something that happened in between tbh)
 
-v1.1.0 - Discord Release
+
+v1.1.0 
 - Offset settings consistency (same in the object tool, wall tool and path tool)
 - New toggle option for wall shadows: Below All Walls ON/OFF
 - Better copy for paths
