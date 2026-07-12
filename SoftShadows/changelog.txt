@@ -1,3 +1,12 @@
+SOFT SHADOWS
+
+v1.5.0
+- Fixed global bake mixing levels at reload
+- Added a Realistic option for Paths and Walls shadows (needs more GPU than the simple mode)
+- Added a Bend option for paths (adds an effect to create a bulge)
+- Added a vertical overlay option for paths (goes along the path instead of starting at an end)
+- Renamed "Reset Defaults" to "Factory Reset"
+
 v1.4.2
 - Optimized and improved "Extrude" shadows
 - Fixed long shadows being cropped at export in high res

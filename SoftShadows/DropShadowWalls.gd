@@ -23,12 +23,15 @@ const USER_DEFAULTS_WALL_KEY = "DropShadowUserDefaultsWall"
 const FACTORY_DEFAULTS = {
 	"enabled": false,
 	"opacity": 0.6,
+	"opacity_realistic": 0.6,
 	"softness": 2.75,
 	"direction": 2,
 	"spread": 0.25,
 	"offset_x": 0.0,
 	"offset_y": 0.0,
 	"radial_offset": 0.0,
+	"crop_blur": false,
+	"crop_ends": false,
 	"side_balance": 0.0,
 	"range": 1.0,
 	"snap_angle": -1.0,
@@ -46,6 +49,8 @@ const FACTORY_DEFAULTS = {
 	"swap_ends": false,
 	"skip_portals": false,
 	"below_all_walls": false,
+	"render_mode": "simple",   # "simple" = mesh géométrique | "realistic" = silhouette texturée floutée
+	"realistic_blur": 0.2,     # flou du mode realistic (0 = net) ; 0..1 -> 0..REALISTIC_BLUR_MAX_PX
 	"shadow_color": Color(0, 0, 0, 1)
 }
 
@@ -57,6 +62,34 @@ var _stashed_extend = {}  # { node_id: { extend_enabled, fade_in_enabled, fade_o
 
 
 enum ShadowDirection { OUTER = 0, INNER = 1, BOTH = 2 }
+
+# --- Mode "Realistic" (walls) : silhouette texturée du mur, capturée en viewport,
+# décalée, floutée (noyau polaire + mips), rendue dessous. Portage du pipeline paths.
+const REALISTIC_BLUR_MAX_PX = 180.0    # plafond du rayon de flou (world px)
+const REALISTIC_MIN_BLUR_PX = 0.5      # en deçà : copie nette (pas de bake polaire)
+const REALISTIC_BLUR_FLOOR_PX = 6.0    # palier bas : tout flou > 0 vaut au moins ça
+const REALISTIC_VP_MAX_DIM = 2048.0    # résolution max de la capture (downscale au-delà)
+const REALISTIC_VP_DOWNSAMPLE = 1.0    # pleine résolution
+const REALISTIC_BLUR_STEPS = 24        # nb d'angles du noyau polaire
+const REALISTIC_BLUR_QUALITY = 8       # nb d'anneaux radiaux
+const REALISTIC_FOLD_SAFETY = 1.5     # offset concave max = SAFETY * rayon de courbure (anti-repli)
+const REALISTIC_OUTER_GAIN = 1.5      # le côté extérieur ressort plus que l'intérieur (bridé aux coins) -> léger retrait quand il est poussé
+var _silhouette_bake_shader = null     # shader silhouette pour le ruban-mesh (radial)
+var _realistic_gen = {}                # instance_id -> génération (annule les captures obsolètes)
+var _wall_r_capturing = {}             # instance_id -> génération en cours de capture (le monitor saute ce nœud tant qu'une capture est en vol)
+var _wall_loop_nat = {}                # instance_id -> {tex, origin, content, sig} : bitmap naturel de boucle caché (phase DD, indépendant du radial)
+var _wall_r_live = {}                  # instance_id -> {sprite, vp_size, scale_f, base_pos, parent, line, line_xform} : MAJ en place des réglages
+var _wall_r_session = {}               # instance_id -> {vp, container, sprite, scale_f, base_pos, tsize, parent, line, line_xform} : session live (viewport persistant)
+var _wall_r_last_req = {}              # instance_id -> ms du dernier update live (déclenche le settle)
+const WALL_R_LIVE_HEADROOM = 1.3       # marge sur la taille du viewport live (évite les resize)
+const WALL_R_LIVE_SETTLE_MS = 180      # calme après édition -> bake statique mipmappé
+var _wall_last_changed = ""            # dernier réglage modifié (pour décider MAJ live vs recapture)
+const WALL_R_LIVE_PARAMS = ["offset_x", "offset_y", "opacity", "shadow_color", "realistic_blur", "range", "radial_offset", "side_balance", "direction"]
+var _wall_r_settle = {}                # instance_id -> cfg en attente de recapture (silhouette changée)
+var _wall_r_settle_time = {}           # instance_id -> ticks du dernier changement
+const WALL_R_SETTLE_MS = 160           # calme après édition -> recapture (radial/side/géométrie)
+var _realistic_vp_shader = null
+var _wall_silhouette_shader = null
 
 # Logging Functions
 const ENABLE_LOGGING = true
@@ -958,7 +991,7 @@ func initialise() -> void:
 		shadow_history.register_resync(self, "_history_force_resync")
 
 	outputlog("Drop Shadow Walls initialised. (ba-cleanup-v3)", 0)
-	outputlog("[BUILD: WALLS-SCANSKIP-FIX-2026-06-21]", 0)
+	outputlog("[BUILD: WALLS-CLONESRC-1]", 0)
 
 #########################################################################################################
 ##
@@ -1093,9 +1126,20 @@ func _deferred_on_new_node_added(node):
 		var src_config = global.ModMapData[SHADOW_DATA_KEY][source_id]
 		var new_config = src_config.duplicate()
 		save_shadow_data(node, new_config)
+		outputlog("[COPY-DIAG] heritage " + new_id + " <- " + source_id + " mode=" + str(new_config.get("render_mode", "simple")) + " enabled=" + str(new_config.get("enabled", false)), 0)
 		if new_config.get("enabled", false):
 			# Delay shadow creation slightly to let DD finish building the node
 			yield(global.Editor.get_tree().create_timer(0.05), "timeout")
+			# Realistic : la capture exige les Line2D enfants (segments) du mur, que DD
+			# construit de façon ASYNCHRONE après la copie. Le délai fixe suffisait au
+			# mode simple (points) mais pas au realistic -> sortie silencieuse sans
+			# ombre. On attend que le Line2D existe (jusqu'à ~2s).
+			if new_config.get("render_mode", "simple") == "realistic":
+				var _tries = 0
+				while _tries < 20 and is_instance_valid(node) and get_line2d(node) == null:
+					yield(global.Editor.get_tree().create_timer(0.1), "timeout")
+					_tries += 1
+				outputlog("[COPY-DIAG] realistic ready apres " + str(_tries) + " essais, line=" + str(get_line2d(node) != null if is_instance_valid(node) else "node freed"), 0)
 			if is_instance_valid(node):
 				remove_shadow(node)
 				create_shadow(node, new_config)
@@ -1139,6 +1183,7 @@ func _find_clone_source(node, node_type: String, new_id: String) -> String:
 	var new_shape = _get_wall_shape_hash(node)
 	if new_shape == 0:
 		return ""
+	var matches = []
 	for src_id in global.ModMapData[SHADOW_DATA_KEY].keys():
 		if str(src_id) == new_id:
 			continue
@@ -1150,8 +1195,19 @@ func _find_clone_source(node, node_type: String, new_id: String) -> String:
 		if get_node_type(src) != node_type:
 			continue
 		if _get_wall_shape_hash(src) == new_shape:
-			return str(src_id)
-	return ""
+			matches.append(str(src_id))
+	if matches.size() == 0:
+		return ""
+	if matches.size() == 1:
+		return matches[0]
+	# Plusieurs candidats de MÊME forme (copie de copie : l'original et ses copies ont
+	# un hash identique) : préfère le plus RÉCEMMENT SÉLECTIONNÉ — pour copier un mur,
+	# on l'a forcément sélectionné juste avant le Ctrl+C. Sans ça, le premier trouvé
+	# (souvent l'original) imposait sa config aux copies de copies.
+	for rnid in _select_recency:
+		if matches.has(rnid):
+			return rnid
+	return matches[0]
 
 func _find_split_source(node, node_type: String) -> String:
 	# Method 1: Check current selection
@@ -1231,6 +1287,7 @@ func _update_wall_point_snapshot():
 
 # Monitoring: track selected path state to detect changes (edit points, transitions)
 var _monitored_path = null
+var _select_recency = []   # node_ids sélectionnés, du plus récent au plus ancien (cap 8)
 var _monitored_points_hash = 0
 var _monitored_transitions_hash = 0
 var _monitored_type = ""  # "paths" or "walls"
@@ -1857,6 +1914,29 @@ func _build_wall_tool_ui():
 	wt_ui["enable_check"] = wt_enable
 	wt_container.add_child(title_hbox)
 
+	# Render mode: Simple | Realistic (radio) — comme dans le Select tool / Path Tool.
+	var wt_mode_wrapper = VBoxContainer.new()
+	wt_mode_wrapper.visible = false
+	wt_ui["mode_wrapper"] = wt_mode_wrapper
+	var wt_mode_hbox = HBoxContainer.new()
+	var wt_mode_names = ["Simple", "Realistic"]
+	for mi in range(2):
+		var mbtn = Button.new()
+		mbtn.text = " " + wt_mode_names[mi]
+		mbtn.toggle_mode = true
+		mbtn.pressed = (mi == _render_mode_to_index(DEFAULT_SHADOW_CONFIG.get("render_mode", "simple")))
+		mbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		mbtn.align = Button.ALIGN_LEFT
+		if mbtn.pressed:
+			mbtn.icon = mbtn.get_icon("radio_checked", "CheckBox")
+		else:
+			mbtn.icon = mbtn.get_icon("radio_unchecked", "CheckBox")
+		mbtn.connect("pressed", self, "_on_wt_render_mode_pressed", [mi])
+		wt_mode_hbox.add_child(mbtn)
+		wt_ui["mode_btn_" + str(mi)] = mbtn
+	wt_mode_wrapper.add_child(wt_mode_hbox)
+	wt_container.add_child(wt_mode_wrapper)
+
 	# Direction buttons (visible when ON, outside settings panel)
 	var dir_wrapper = VBoxContainer.new()
 	dir_wrapper.visible = false
@@ -1971,6 +2051,7 @@ func _get_wall_tool_config() -> Dictionary:
 	cfg["spread"] = wt_ui["spread_spin"].value
 	cfg["softness"] = wt_ui["softness_spin"].value
 	cfg["direction"] = _get_wt_direction()
+	cfg["render_mode"] = _render_mode_from_index(_get_wt_render_mode())
 	# Extend (now means: draw rounded caps at ends — no longer forces fade_in/out)
 	if wt_ui.has("extend_check"):
 		cfg["extend_enabled"] = wt_ui["extend_check"].pressed
@@ -1990,6 +2071,23 @@ func _on_wt_direction_pressed(dir_index):
 			btn.icon = btn.get_icon("radio_checked", "CheckBox")
 		else:
 			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
+
+func _on_wt_render_mode_pressed(mode_index):
+	for i in range(2):
+		if not wt_ui.has("mode_btn_" + str(i)):
+			continue
+		var b = wt_ui["mode_btn_" + str(i)]
+		b.pressed = (i == mode_index)
+		if i == mode_index:
+			b.icon = b.get_icon("radio_checked", "CheckBox")
+		else:
+			b.icon = b.get_icon("radio_unchecked", "CheckBox")
+
+func _get_wt_render_mode() -> int:
+	for i in range(2):
+		if wt_ui.has("mode_btn_" + str(i)) and wt_ui["mode_btn_" + str(i)].pressed:
+			return i
+	return 0
 
 func _on_wt_slider_changed(value, which):
 	wt_ui[which + "_spin"].value = value
@@ -2017,6 +2115,8 @@ func _on_wt_reset_pressed():
 func _on_wall_tool_shadow_toggled(pressed):
 	if wt_ui.has("dir_wrapper"):
 		wt_ui["dir_wrapper"].visible = pressed
+		if wt_ui.has("mode_wrapper"):
+			wt_ui["mode_wrapper"].visible = pressed
 	if wt_ui.has("cog_btn"):
 		wt_ui["cog_btn"].visible = pressed
 	if wt_ui.has("reset_btn"):
@@ -2078,6 +2178,7 @@ func _sync_wt_ui_from_defaults():
 	wt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	wt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	_on_wt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
+	_on_wt_render_mode_pressed(_render_mode_to_index(cfg.get("render_mode", "simple")))
 	if wt_ui.has("extend_check"):
 		wt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
 
@@ -2153,6 +2254,9 @@ func _update_path_tool_live_shadow():
 var _scan_skip_ids := {}
 
 func _on_monitor_tick():
+	# Recapture realistic différée (radial/side/géométrie) au repos.
+	_process_wall_r_session_settle()
+	_process_wall_r_settle()
 	# Détection des ops natives (move/reshape/delete) pour la timeline undo/redo.
 	_detect_native_wall_ops()
 	if not _native_detect_ready:
@@ -2225,6 +2329,12 @@ func _on_monitor_tick():
 	if new_monitored != null and new_monitored != _monitored_path:
 		_reparent_ui_to_node(new_monitored)
 		_monitored_path = new_monitored
+		if new_monitored.has_meta("node_id"):
+			var _rnid = str(new_monitored.get_meta("node_id"))
+			_select_recency.erase(_rnid)
+			_select_recency.push_front(_rnid)
+			if _select_recency.size() > 8:
+				_select_recency.pop_back()
 		_monitored_type = get_node_type(new_monitored)
 		_monitored_points_hash = _get_points_hash(new_monitored)
 		_monitored_transitions_hash = _get_transitions_hash(new_monitored)
@@ -2259,6 +2369,11 @@ func _on_monitor_tick():
 			_scan_skip_ids[node_id] = true
 			continue
 
+		# Capture realistic async en cours : ne pas reconstruire (le meta est
+		# temporairement vide -> sinon rebuild en boucle qui annule la capture).
+		if _wall_r_capturing.has(scan_node.get_instance_id()):
+			continue
+
 		var new_hash = _get_points_hash(scan_node)
 		var old_hash = _all_points_hashes.get(node_id, 0)
 		
@@ -2289,8 +2404,14 @@ func _on_monitor_tick():
 					config["fade_in_enabled"] = false
 					config["fade_out_enabled"] = false
 					save_shadow_data(scan_node, config)
-			remove_shadow(scan_node)
-			create_shadow(scan_node, config)
+			if config.get("render_mode", "simple") == "realistic" and scan_node.has_meta(SHADOW_META_KEY) and not shadow_orphaned:
+				# Déplacement/reshape d'un mur realistic : on REPOSITIONNE le sprite en
+				# direct (suit le mur, texture actuelle) + re-bake la silhouette au repos.
+				# Jamais de remove -> aucun flicker.
+				_wall_r_follow_and_settle(scan_node, config)
+			else:
+				remove_shadow(scan_node)
+				create_shadow(scan_node, config)
 			# Also update monitored hash if it's the same path
 			if scan_node == _monitored_path:
 				_monitored_points_hash = new_hash
@@ -2449,6 +2570,30 @@ func build_select_tool_ui():
 	container.add_child(title_hbox)
 	ui_config["enable_check"] = enable_check
 
+	# Render mode: Simple (mesh géométrique) | Realistic (silhouette texturée floutée)
+	# Au-dessus du sélecteur de direction, comme dans le path tool. Masqué quand l'ombre est OFF.
+	var mode_wrapper = VBoxContainer.new()
+	mode_wrapper.visible = false
+	var mode_btn_container = HBoxContainer.new()
+	var mode_names = ["Simple", "Realistic"]
+	for mi in range(2):
+		var mbtn = Button.new()
+		mbtn.text = " " + mode_names[mi]
+		mbtn.toggle_mode = true
+		mbtn.pressed = (mi == _render_mode_to_index(DEFAULT_SHADOW_CONFIG.get("render_mode", "simple")))
+		mbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		mbtn.align = Button.ALIGN_LEFT
+		if mbtn.pressed:
+			mbtn.icon = mbtn.get_icon("radio_checked", "CheckBox")
+		else:
+			mbtn.icon = mbtn.get_icon("radio_unchecked", "CheckBox")
+		mbtn.connect("pressed", self, "_on_wall_render_mode_pressed", [mi])
+		mode_btn_container.add_child(mbtn)
+		ui_config["mode_btn_" + str(mi)] = mbtn
+	mode_wrapper.add_child(mode_btn_container)
+	container.add_child(mode_wrapper)
+	ui_config["mode_wrapper"] = mode_wrapper
+
 	# Direction buttons - hidden when shadow is OFF
 	var dir_wrapper = VBoxContainer.new()
 	dir_wrapper.visible = false
@@ -2529,6 +2674,7 @@ func build_select_tool_ui():
 	var spread_reset = _make_icon_button("icons/reset.png", "Reset spread", 0.5)
 	spread_reset.connect("pressed", self, "_on_single_reset", ["spread"])
 	spread_hbox.add_child(spread_reset)
+	ui_config["spread_hbox"] = spread_hbox
 	settings_panel.add_child(spread_hbox)
 
 	# -- Softness: [Label] [Slider] [SpinBox] [Reset] --
@@ -2558,7 +2704,63 @@ func build_select_tool_ui():
 	var soft_reset = _make_icon_button("icons/reset.png", "Reset softness", 0.5)
 	soft_reset.connect("pressed", self, "_on_single_reset", ["softness"])
 	soft_hbox.add_child(soft_reset)
+	ui_config["softness_hbox"] = soft_hbox
 	settings_panel.add_child(soft_hbox)
+
+	# -- Blur (mode Realistic uniquement) : [Label] [Slider] --
+	var blur_hbox = HBoxContainer.new()
+	blur_hbox.visible = false
+	var blur_label = Label.new()
+	blur_label.text = "Blur"
+	blur_label.rect_min_size.x = 60
+	blur_hbox.add_child(blur_label)
+	var blur_slider = HSlider.new()
+	blur_slider.min_value = 0.0
+	blur_slider.max_value = 1.0
+	blur_slider.step = 0.01
+	blur_slider.value = DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2)
+	blur_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	blur_slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	blur_slider.connect("value_changed", self, "_on_slider_changed", ["realistic_blur"])
+	blur_hbox.add_child(blur_slider)
+	ui_config["realistic_blur_slider"] = blur_slider
+	ui_config["realistic_blur_hbox"] = blur_hbox
+	settings_panel.add_child(blur_hbox)
+	# Crop Blur : visible en Side A/B, restreint le flou au côté choisi.
+	var crop_hbox = HBoxContainer.new()
+	crop_hbox.visible = false
+	var crop_label = Label.new()
+	crop_label.text = "Crop at Center"
+	crop_label.rect_min_size.x = 60
+	crop_hbox.add_child(crop_label)
+	var crop_spacer = Control.new()
+	crop_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	crop_hbox.add_child(crop_spacer)
+	var crop_check = CheckButton.new()
+	crop_check.pressed = DEFAULT_SHADOW_CONFIG.get("crop_blur", false)
+	crop_check.connect("toggled", self, "_on_crop_blur_toggled")
+	crop_hbox.add_child(crop_check)
+	ui_config["crop_blur_check"] = crop_check
+	ui_config["crop_blur_hbox"] = crop_hbox
+	settings_panel.add_child(crop_hbox)
+	# Crop Ends : visible en Realistic (toute direction), coupe le flou au dernier
+	# pixel de l'endcap à chaque extrémité du mur. Indépendant de Crop Blur.
+	var cends_hbox = HBoxContainer.new()
+	cends_hbox.visible = false
+	var cends_label = Label.new()
+	cends_label.text = "Crop Ends"
+	cends_label.rect_min_size.x = 60
+	cends_hbox.add_child(cends_label)
+	var cends_spacer = Control.new()
+	cends_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cends_hbox.add_child(cends_spacer)
+	var cends_check = CheckButton.new()
+	cends_check.pressed = DEFAULT_SHADOW_CONFIG.get("crop_ends", false)
+	cends_check.connect("toggled", self, "_on_crop_ends_toggled")
+	cends_hbox.add_child(cends_check)
+	ui_config["crop_ends_check"] = cends_check
+	ui_config["crop_ends_hbox"] = cends_hbox
+	settings_panel.add_child(cends_hbox)
 
 	# -- Extend Ends with Fade: toggle row + distance slider --
 	# The toggle row (ext_hbox) starts in dir_wrapper (main area)
@@ -3052,7 +3254,7 @@ func build_select_tool_ui():
 	save_default_btn.connect("pressed", self, "_on_save_default_pressed")
 	def_hbox.add_child(save_default_btn)
 	var reset_default_btn = Button.new()
-	reset_default_btn.text = "Reset Defaults"
+	reset_default_btn.text = "Factory Reset"
 	reset_default_btn.hint_tooltip = "Restore factory default settings"
 	reset_default_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	reset_default_btn.visible = false
@@ -3179,6 +3381,7 @@ func _on_slider_changed(value, which):
 	if _syncing_ui:
 		return
 	_dirty_properties[which] = true
+	_wall_last_changed = which
 	_syncing_ui = true
 	match which:
 		"opacity":
@@ -3211,6 +3414,7 @@ func _on_spin_changed(value, which):
 	if _syncing_ui:
 		return
 	_dirty_properties[which] = true
+	_wall_last_changed = which
 	_syncing_ui = true
 	match which:
 		"opacity":
@@ -3462,6 +3666,7 @@ func _on_offset_spin_changed(_value = null):
 				_syncing_ui = false
 				_dirty_properties["offset_x"] = true
 				_dirty_properties["offset_y"] = true
+				_wall_last_changed = "offset_x"
 				apply_shadow_to_selected_paths()
 				return
 	var angle_rad = deg2rad(angle_deg)
@@ -3474,6 +3679,7 @@ func _on_offset_spin_changed(_value = null):
 	_syncing_ui = false
 	_dirty_properties["offset_x"] = true
 	_dirty_properties["offset_y"] = true
+	_wall_last_changed = "offset_x"
 	apply_shadow_to_selected_paths()
 
 func _set_dial_values(ox: float, oy: float):
@@ -3485,6 +3691,7 @@ func _set_dial_values(ox: float, oy: float):
 	_syncing_ui = false
 	_dirty_properties["offset_x"] = true
 	_dirty_properties["offset_y"] = true
+	_wall_last_changed = "offset_x"
 
 func _update_angle_distance_from_xy(ox: float, oy: float):
 	var dist = sqrt(ox * ox + oy * oy)
@@ -3549,9 +3756,11 @@ func _on_direction_pressed(dir_index):
 	if _syncing_ui:
 		return
 	_dirty_properties["direction"] = true
+	_wall_last_changed = "direction"
 	_syncing_ui = true
 	_set_direction_buttons(dir_index)
 	_syncing_ui = false
+	_update_crop_blur_visibility()
 	apply_shadow_to_selected_paths()
 
 func _set_direction_buttons(active_index: int):
@@ -3786,6 +3995,8 @@ func _on_section_toggled(pressed, section_key):
 func _on_setting_changed(_value = null):
 	var is_on = ui_config["enable_check"].pressed
 	ui_config["dir_wrapper"].visible = is_on
+	if ui_config.has("mode_wrapper"):
+		ui_config["mode_wrapper"].visible = is_on
 	ui_config["settings_toggle"].visible = is_on
 	ui_config["title_reset_btn"].visible = is_on
 	if not is_on:
@@ -3961,10 +4172,104 @@ func _on_below_all_walls_toggled(_pressed):
 	_dirty_properties["below_all_walls"] = true
 	apply_shadow_to_selected_paths()
 
+func _render_mode_to_index(mode) -> int:
+	return 1 if str(mode) == "realistic" else 0
+
+func _render_mode_from_index(idx: int) -> String:
+	return "realistic" if int(idx) == 1 else "simple"
+
+# Opacité indépendante par mode : le slider tient le mode actif, la valeur de l'autre mode
+# est stockée dans ui_config["opacity_inactive"]. Renvoie [opacity_simple, opacity_realistic].
+func _get_ui_opacities() -> Array:
+	var def_s = DEFAULT_SHADOW_CONFIG["opacity"]
+	var def_r = DEFAULT_SHADOW_CONFIG.get("opacity_realistic", def_s)
+	if not ui_config.has("opacity_slider"):
+		return [def_s, def_r]
+	var active = ui_config["opacity_slider"].value
+	var other = ui_config.get("opacity_inactive", def_r)
+	var realistic = ui_config.has("mode_btn_1") and ui_config["mode_btn_1"].pressed
+	if realistic:
+		return [other, active]
+	return [active, other]
+
+func _on_crop_blur_toggled(_pressed):
+	if _syncing_ui:
+		return
+	_dirty_properties["crop_blur"] = true
+	# Pas un param "live" -> force le chemin settle/re-bake (le masque doit être (re)capturé).
+	_wall_last_changed = "crop_blur"
+	apply_shadow_to_selected_paths()
+
+func _on_crop_ends_toggled(_pressed):
+	if _syncing_ui:
+		return
+	_dirty_properties["crop_ends"] = true
+	# Pas un param "live" -> force le chemin settle/re-bake (le masque doit être (re)capturé).
+	_wall_last_changed = "crop_ends"
+	apply_shadow_to_selected_paths()
+
+func _update_crop_blur_visibility():
+	if not ui_config.has("crop_blur_hbox"):
+		return
+	var realistic = ui_config.has("mode_btn_1") and ui_config["mode_btn_1"].pressed
+	var dir = _get_selected_direction()
+	ui_config["crop_blur_hbox"].visible = realistic and dir != ShadowDirection.BOTH
+	# Crop Ends : Realistic, toute direction (y compris Both).
+	if ui_config.has("crop_ends_hbox"):
+		ui_config["crop_ends_hbox"].visible = realistic
+
+func _set_render_mode_buttons(active_index: int):
+	for i in range(2):
+		if not ui_config.has("mode_btn_" + str(i)):
+			continue
+		ui_config["mode_btn_" + str(i)].pressed = (i == active_index)
+		if i == active_index:
+			ui_config["mode_btn_" + str(i)].icon = ui_config["mode_btn_" + str(i)].get_icon("radio_checked", "CheckBox")
+		else:
+			ui_config["mode_btn_" + str(i)].icon = ui_config["mode_btn_" + str(i)].get_icon("radio_unchecked", "CheckBox")
+	var _realistic = (active_index == 1)
+	# Blur : mode Realistic uniquement. Spread/Softness : mode Simple uniquement.
+	if ui_config.has("realistic_blur_hbox"):
+		ui_config["realistic_blur_hbox"].visible = _realistic
+	if ui_config.has("spread_hbox"):
+		ui_config["spread_hbox"].visible = not _realistic
+	if ui_config.has("softness_hbox"):
+		ui_config["softness_hbox"].visible = not _realistic
+	# Opacité max doublée en Realistic (le flou atténue l'ombre -> on peut vouloir la
+	# renforcer au-delà de 1.0 ; le shader n'est pas bridé).
+	if ui_config.has("opacity_slider"):
+		var omax = 2.0 if _realistic else 1.0
+		ui_config["opacity_slider"].max_value = omax
+		if ui_config.has("opacity_spin"):
+			ui_config["opacity_spin"].max_value = omax
+	_update_crop_blur_visibility()
+
+func _on_wall_render_mode_pressed(mode_index):
+	if _syncing_ui:
+		return
+	_syncing_ui = true
+	# Opacité indépendante : échange le slider avec la valeur du mode inactif (max d'abord
+	# pour ne pas clamper une valeur realistic >1 en passant par un max simple).
+	if ui_config.has("opacity_slider"):
+		var _cur = ui_config["opacity_slider"].value
+		var _oth = ui_config.get("opacity_inactive", DEFAULT_SHADOW_CONFIG.get("opacity_realistic", DEFAULT_SHADOW_CONFIG["opacity"]))
+		ui_config["opacity_inactive"] = _cur
+		var _mx = 2.0 if mode_index == 1 else 1.0
+		ui_config["opacity_slider"].max_value = _mx
+		ui_config["opacity_spin"].max_value = _mx
+		ui_config["opacity_slider"].value = _oth
+		ui_config["opacity_spin"].value = _oth
+	_set_render_mode_buttons(mode_index)
+	_update_transition_visibility(_monitored_type)
+	_syncing_ui = false
+	_dirty_properties["render_mode"] = true
+	apply_shadow_to_selected_paths()
+
 func _on_color_changed(_color):
 	if _syncing_ui:
 		return
 	_dirty_properties["shadow_color"] = true
+	_wall_last_changed = "shadow_color"
 	apply_shadow_to_selected_paths()
 
 # === Portal "Keep Wall Shadow" toggle ===
@@ -4306,12 +4611,15 @@ func get_current_shadow_config() -> Dictionary:
 	return {
 		"enabled": ui_config["enable_check"].pressed,
 		"settings_open": ui_config["settings_toggle"].pressed,
-		"opacity": ui_config["opacity_slider"].value,
+		"opacity": _get_ui_opacities()[0],
+		"opacity_realistic": _get_ui_opacities()[1],
 		"softness": ui_config["softness_slider"].value,
 		"direction": _get_selected_direction(),
 		"spread": ui_config["spread_slider"].value,
 		"offset_x": ui_config["offset_x_spin"].value,
 		"offset_y": ui_config["offset_y_spin"].value,
+		"crop_blur": (ui_config["crop_blur_check"].pressed if ui_config.has("crop_blur_check") else false),
+		"crop_ends": (ui_config["crop_ends_check"].pressed if ui_config.has("crop_ends_check") else false),
 		"radial_offset": ui_config["radial_offset_spin"].value if ui_config.has("radial_offset_spin") else DEFAULT_SHADOW_CONFIG["radial_offset"],
 		"side_balance": ui_config["side_balance_spin"].value if ui_config.has("side_balance_spin") else DEFAULT_SHADOW_CONFIG["side_balance"],
 		"range": ui_config["range_spin"].value if ui_config.has("range_spin") else DEFAULT_SHADOW_CONFIG["range"],
@@ -4330,6 +4638,8 @@ func get_current_shadow_config() -> Dictionary:
 		"swap_ends": ui_config["swap_ends_check"].pressed,
 		"skip_portals": ui_config["skip_portals_check"].pressed,
 		"below_all_walls": ui_config["below_all_walls_check"].pressed,
+		"render_mode": _render_mode_from_index(1 if (ui_config.has("mode_btn_1") and ui_config["mode_btn_1"].pressed) else 0),
+		"realistic_blur": (ui_config["realistic_blur_slider"].value if ui_config.has("realistic_blur_slider") else DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2)),
 		"shadow_color": ui_config["shadow_color_picker"].color
 	}
 
@@ -4521,10 +4831,17 @@ func apply_shadow_to_selected_paths():
 					cfg["extend_enabled"] = false
 					cfg["fade_in_enabled"] = false
 					cfg["fade_out_enabled"] = false
-			remove_shadow(node)
-			if cfg["enabled"]:
-				create_shadow(node, cfg)
-			save_shadow_data(node, cfg)
+			if cfg["enabled"] and node.has_meta(SHADOW_META_KEY) and _can_live_update_realistic_wall(cfg) and _live_update_realistic_wall(node, cfg):
+				save_shadow_data(node, cfg)
+			elif cfg["enabled"] and cfg.get("render_mode", "simple") == "realistic" and node.has_meta(SHADOW_META_KEY):
+				_wall_r_settle[node.get_instance_id()] = cfg.duplicate()
+				_wall_r_settle_time[node.get_instance_id()] = OS.get_ticks_msec()
+				save_shadow_data(node, cfg)
+			else:
+				remove_shadow(node)
+				if cfg["enabled"]:
+					create_shadow(node, cfg)
+				save_shadow_data(node, cfg)
 		else:
 			# Existing path (not monitored): apply only enabled, skip_portals,
 			# and any properties the user has explicitly changed (dirty)
@@ -4534,17 +4851,32 @@ func apply_shadow_to_selected_paths():
 			saved["skip_portals"] = ui_cfg.get("skip_portals", false)
 			# Apply any properties the user has manually changed
 			for dirty_key in _dirty_properties:
-				if ui_cfg.has(dirty_key):
-					saved[dirty_key] = ui_cfg[dirty_key]
+				var eff_key = dirty_key
+				# En mode Realistic, le slider Opacity pilote opacity_realistic : c'est
+				# cette clé qu'il faut propager à la sélection (sinon seuls le monitored
+				# et les nouveaux murs changeaient d'opacité).
+				if dirty_key == "opacity" and ui_cfg.get("render_mode", "simple") == "realistic":
+					eff_key = "opacity_realistic"
+				if ui_cfg.has(eff_key):
+					saved[eff_key] = ui_cfg[eff_key]
 			# Closed loops without skipped portals can't have extend
 			if is_path_closed(node) and not _wall_has_skipped_portals(node, saved.get("skip_portals", false)):
 				saved["extend_enabled"] = false
 				saved["fade_in_enabled"] = false
 				saved["fade_out_enabled"] = false
-			remove_shadow(node)
-			if saved["enabled"]:
-				create_shadow(node, saved)
-			save_shadow_data(node, saved)
+			if saved["enabled"] and node.has_meta(SHADOW_META_KEY) and _can_live_update_realistic_wall(saved) and _live_update_realistic_wall(node, saved):
+				save_shadow_data(node, saved)
+			elif saved["enabled"] and saved.get("render_mode", "simple") == "realistic" and node.has_meta(SHADOW_META_KEY):
+				_wall_r_settle[node.get_instance_id()] = saved.duplicate()
+				_wall_r_settle_time[node.get_instance_id()] = OS.get_ticks_msec()
+				save_shadow_data(node, saved)
+			else:
+				remove_shadow(node)
+				if saved["enabled"]:
+					create_shadow(node, saved)
+				save_shadow_data(node, saved)
+	# Réglage traité : réinitialise pour qu'un prochain apply non-réglage force une recapture.
+	_wall_last_changed = ""
 
 # Bevel sharp corners for a specific shadow side.
 # sign_dir: 1.0 for outer, -1.0 for inner
@@ -4553,6 +4885,41 @@ func apply_shadow_to_selected_paths():
 # - Convex side: arc of points for smooth shadow
 # - Concave side: bevel with shadow fading to zero at corner
 # Returns [PoolVector2Array points, Array corner_factors]
+# Suit un mur realistic en direct pendant un déplacement/reshape : repositionne le sprite
+# existant (base_pos recalculé sur la géométrie courante) sans le retirer -> pas de flicker,
+# et planifie un re-bake de la silhouette au repos (au cas où la forme a changé).
+func _wall_r_follow_and_settle(node, cfg):
+	var nid = node.get_instance_id()
+	var line = get_line2d(node)
+	if line == null or not is_instance_valid(line):
+		remove_shadow(node)
+		create_shadow(node, cfg)
+		return
+	var shadow_color = cfg.get("shadow_color", Color(0, 0, 0, 1))
+	if shadow_color is String:
+		shadow_color = Color(shadow_color)
+	var opacity = cfg.get("opacity_realistic", cfg.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"]))
+	var blur_px = _realistic_blur_px_from_frac(cfg.get("realistic_blur", DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2)))
+	var radial = _make_radial(cfg)
+	var offset = Vector2(cfg.get("offset_x", 0.0), cfg.get("offset_y", 0.0))
+	if line.rotation != 0.0:
+		offset = offset.rotated(-line.rotation)
+	# Session live : re-peuple la silhouette (nouvelle forme/orientation) + repositionne, en
+	# direct via le viewport persistant. Suit move/rotate/reshape sans flicker.
+	if _wall_r_session.has(nid):
+		if not _update_wall_r_session(nid, node, line, radial, offset, shadow_color, opacity, blur_px):
+			remove_shadow(node)
+			create_shadow(node, cfg)
+		return
+	var below_all = cfg.get("below_all_walls", false)
+	var shadow_parent = _get_wall_r_wrapper(line)
+	var wall_nid = str(node.get_meta("node_id")) if node.has_meta("node_id") else ""
+	if below_all:
+		var ba = _get_below_all_container(line)
+		if ba != null:
+			shadow_parent = ba
+	_start_wall_r_session(node, line, shadow_parent, line.global_transform, wall_nid, radial, offset, shadow_color, opacity, blur_px)
+
 func _bevel_points_for_side(source_points: PoolVector2Array, sign_dir: float, is_closed: bool) -> Array:
 	if source_points.size() < 3:
 		var early_factors = []
@@ -4738,12 +5105,1825 @@ func _add_shadow_mesh(mesh_inst: MeshInstance2D, parent: Node2D, offset: Vector2
 	parent.add_child(mesh_inst)
 
 
+#########################################################################################################
+##  MODE REALISTIC (walls) — statique
+#########################################################################################################
+
+func _realistic_blur_px_from_frac(frac) -> float:
+	frac = clamp(frac, 0.0, 1.0)
+	if frac <= 0.0005:
+		return 0.0
+	return REALISTIC_BLUR_FLOOR_PX + frac * (REALISTIC_BLUR_MAX_PX - REALISTIC_BLUR_FLOOR_PX)
+
+func _realistic_blur_kernel(blur_px, scale_f) -> Array:
+	# [rayon en texels, mip_lod]. Le mip comble les trous radiaux du noyau au flou fort.
+	var blur_vp = blur_px * scale_f
+	var mip_lod = 0.0
+	var spacing = blur_vp / float(REALISTIC_BLUR_QUALITY)
+	if spacing > 1.0:
+		mip_lod = log(spacing) / log(2.0)
+	return [blur_vp, mip_lod]
+
+func _apply_realistic_blur_params(mat, tsize, blur_px, scale_f, shadow_color, opacity, has_mips = true):
+	var blur_vp = blur_px * scale_f
+	var mip_lod = 0.0
+	var quality = REALISTIC_BLUR_QUALITY
+	if has_mips:
+		var spacing = blur_vp / float(REALISTIC_BLUR_QUALITY)
+		if spacing > 1.0:
+			mip_lod = log(spacing) / log(2.0)
+	else:
+		# Session live (ViewportTexture sans mips) : on ne peut pas s'appuyer sur le mip
+		# pour combler les trous du noyau -> on met assez d'anneaux (spacing<=1) pour ne
+		# pas sous-échantillonner (sinon alpha trop faible = ombre terne). Plafonné (perf).
+		quality = int(clamp(ceil(blur_vp), REALISTIC_BLUR_QUALITY, 40))
+	mat.set_shader_param("shadow_color", shadow_color)
+	mat.set_shader_param("shadow_strength", opacity)
+	mat.set_shader_param("texel", Vector2(1.0 / tsize.x, 1.0 / tsize.y))
+	mat.set_shader_param("blur_px", blur_vp)
+	mat.set_shader_param("mip_lod", mip_lod)
+	mat.set_shader_param("vertex_scale", Vector2((tsize.x + 2.0 * blur_vp) / tsize.x, (tsize.y + 2.0 * blur_vp) / tsize.y))
+	mat.set_shader_param("blur_steps", REALISTIC_BLUR_STEPS)
+	mat.set_shader_param("blur_quality", quality)
+
+# Shader silhouette pour la copie Line2D du mur : blanc + alpha de la texture -> on
+# capture la SILHOUETTE (forme), pas les couleurs du mur. Modulée (net) ou floutée.
+
+
+
+
+
+func _get_wall_silhouette_shader() -> Shader:
+	if _wall_silhouette_shader != null:
+		return _wall_silhouette_shader
+	var sh = Shader.new()
+	sh.code = """
+shader_type canvas_item;
+render_mode blend_mix;
+uniform float clip_side = 0.0;   // 0 = pas de clip ; +1/-1 = ne garder qu'une moitié (UV.y</>0.5) pour Side A/B
+// Étirement RADIAL par moitié, ancré au MILIEU de la texture (= ligne centrale du mur) :
+// suit la déformation du ruban (f_out/f_in). quad_scale agrandit le quad (vertex) pour
+// faire de la place, le fragment ré-échantillonne chaque moitié avec son facteur.
+uniform float stretch_a = 1.0;   // facteur du côté UV.y < anchor_v
+uniform float stretch_b = 1.0;   // facteur du côté UV.y > anchor_v
+uniform float quad_scale = 1.0;  // = max(1, stretch_a, stretch_b)
+uniform float tex_center_y = 0.0;   // y LOCAL de l'ancre = ligne centrale du MUR (scale vertex)
+uniform float anchor_v = 0.5;       // ancre en UV.y = ligne centrale du MUR dans la texture
+void vertex() {
+	VERTEX.y = tex_center_y + (VERTEX.y - tex_center_y) * quad_scale;
+}
+void fragment() {
+	// Même transformation MONDE que le ruban : d -> d*f, ancrée à la ligne centrale du
+	// mur (anchor_v), PAS au milieu de la texture du sprite -> pas de dérive quand le
+	// sprite est décentré/offset ou le mur asymétrique, proportions préservées.
+	float v = (UV.y - anchor_v) * quad_scale;
+	float f = v < 0.0 ? stretch_a : stretch_b;
+	float uy = anchor_v + v / max(f, 0.001);
+	if (uy < 0.0 || uy > 1.0) { discard; }
+	vec2 uv2 = vec2(UV.x, uy);
+	if (clip_side != 0.0 && (uv2.y - anchor_v) * clip_side < 0.0) { discard; }
+	COLOR = vec4(1.0, 1.0, 1.0, texture(TEXTURE, uv2).a);
+}
+"""
+	_wall_silhouette_shader = sh
+	return _wall_silhouette_shader
+
+# Flou polaire (identique au pipeline paths). Le mip pré-moyenne chaque échantillon.
+func _get_realistic_vp_blur_shader() -> Shader:
+	if _realistic_vp_shader != null:
+		return _realistic_vp_shader
+	var sh = Shader.new()
+	sh.code = """
+shader_type canvas_item;
+uniform vec4 shadow_color : hint_color = vec4(0.0, 0.0, 0.0, 1.0);
+uniform float shadow_strength : hint_range(0.0, 1.0) = 0.6;
+uniform vec2 texel = vec2(1.0);
+uniform float blur_px = 0.0;
+uniform float mip_lod = 0.0;
+uniform vec2 vertex_scale = vec2(1.0);
+uniform int blur_steps = 24;
+uniform int blur_quality = 8;
+uniform float crop_enabled = 0.0;   // Crop Blur (Side A/B) : discard là où crop_mask est opaque
+uniform sampler2D crop_mask;
+uniform float alpha_gain = 1.0;     // compensation Side sans crop (demi-silhouette) ; clampé à 1
+
+varying vec2 v_scale;
+
+void vertex() {
+	v_scale = vertex_scale;
+	VERTEX *= mat2(vec2(v_scale.x, 0.0), vec2(0.0, v_scale.y));
+}
+
+float samp(sampler2D tex, vec2 p) {
+	if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) { return 0.0; }
+	return textureLod(tex, p, mip_lod).a;
+}
+
+void fragment() {
+	vec2 uv = UV * v_scale - (v_scale - vec2(1.0)) * 0.5;
+	float crop_fade = 1.0;
+	if (crop_enabled > 0.5) {
+		// clamp = extension des pixels de bord : le masque atteint le bord du rect sur le
+		// côté interdit -> les fragments au-delà (vertex_scale) restent croppés.
+		// R = région interdite, G = région gardée (protection) : on ne coupe que là où
+		// l'ombre gardée d'AUCUNE branche n'a le droit d'exister (R sans G) -> pas de
+		// morsure quand une branche non adjacente (hairpin, courbe) passe à portée.
+		vec2 cuv = clamp(uv, vec2(0.0), vec2(1.0));
+		vec4 cm = texture(crop_mask, cuv);
+		// R sans G = crop latéral (Side, binaire). B = Crop Ends, ATTÉNUATION continue :
+		// 1 = coupe dure (dans l'axe du mur), dégradé latéral = fondu dans l'ombre voisine.
+		if (cm.r > 0.5 && cm.g < 0.5) { discard; }
+		crop_fade = 1.0 - min(cm.b, 1.0);
+		if (crop_fade <= 0.003) { discard; }
+	}
+	float total = samp(TEXTURE, uv);
+	float wsum = 1.0;
+	float pi2 = 6.28318;
+	for (int d = 0; d < 48; d++) {
+		if (d >= blur_steps) { break; }
+		float ang = pi2 * float(d) / float(blur_steps);
+		vec2 dir = vec2(cos(ang), sin(ang));
+		for (int i = 1; i <= 16; i++) {
+			if (i > blur_quality) { break; }
+			float frac = float(i) / float(blur_quality);
+			vec2 sp = uv + dir * (blur_px * frac) * texel;
+			float w = exp(-1.2 * frac * frac);
+			total += samp(TEXTURE, sp) * w;
+			wsum += w;
+		}
+	}
+	float a = total / max(wsum, 0.0001);
+	a = min(a * alpha_gain, 1.0) * crop_fade;
+	if (a < 0.003) { discard; }
+	COLOR = vec4(shadow_color.rgb, a * shadow_strength);
+}
+"""
+	_realistic_vp_shader = sh
+	return _realistic_vp_shader
+
+# Libère une liste de nœuds d'ombre (swap atomique realistic).
+# Radial offset / side balance (comme les paths) : rendent la silhouette asymétrique.
+# r (radial) : bascule l'épaisseur d'un côté à l'autre (f_out=1-r, f_in=1+r, largeur totale
+# constante -> décalage perpendiculaire). b (balance) : grossit UN seul côté.
+func _make_radial(config: Dictionary):
+	# Realistic : +/- inversés (vs simple) et portée du radial ×3.
+	var r = -clamp(float(config.get("radial_offset", 0.0)) / 100.0, -1.0, 1.0) * 3.0
+	var b = -clamp(float(config.get("side_balance", 0.0)) / 100.0, -1.0, 1.0)
+	var dir = int(config.get("direction", ShadowDirection.BOTH))
+	# Non-null dès que radial/side OU la direction (Side A/B) demande une silhouette
+	# asymétrique/clippée. En Both sans radial/side -> null -> clone plein rapide.
+	if abs(r) < 0.01 and abs(b) < 0.01 and dir == ShadowDirection.BOTH:
+		return null
+	# Le flag crop est GATÉ par le flou : en net il n'y a pas de débordement, le crop est
+	# inactif et la silhouette Side reste réduite de moitié.
+	var crop = config.get("crop_blur", false)
+	if _realistic_blur_px_from_frac(config.get("realistic_blur", DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2))) < REALISTIC_MIN_BLUR_PX:
+		crop = false
+	return {"r": r, "b": b, "dir": dir, "crop": crop}
+
+# Côté à garder (UV.y</>0.5) pour un sprite (endcap/portail) en Side A/B, selon l'orientation
+# de son UV.y vs la normale du mur. 0 = pas de clip (Both).
+func _sprite_clip_side(clone, wall_normal, dir) -> float:
+	if dir == ShadowDirection.BOTH:
+		return 0.0
+	var s = _sprite_uvy_sign(clone, wall_normal)
+	if s == 0.0:
+		return 0.0
+	return s if dir == ShadowDirection.OUTER else -s
+
+var _tex_vband_cache = {}
+# Étendue verticale OPAQUE d'une texture (fractions 0..1 de sa hauteur, [v_min, v_max)).
+# Échantillonnage par pas en X (<=64 colonnes) -> scan unique ~10-30ms, mis en CACHE par
+# RID (+ région). Texture nulle ou illisible = pleine hauteur (comportement "plein" de
+# la silhouette). Sert à mesurer la bande VISIBLE du mur et du sprite pour normaliser.
+func _texture_vband(tex, region_enabled = false, region_rect = Rect2()) -> Array:
+	if tex == null:
+		return [0.0, 1.0]
+	var key = str(tex.get_rid().get_id())
+	if region_enabled:
+		key += "_" + str(region_rect)
+	if _tex_vband_cache.has(key):
+		return _tex_vband_cache[key]
+	var res = [0.0, 1.0]
+	var img = tex.get_data()
+	if img != null:
+		if img.is_compressed():
+			img.decompress()
+	if img != null and not img.is_compressed():
+		var x0 = 0
+		var y0 = 0
+		var w = img.get_width()
+		var h = img.get_height()
+		if region_enabled and region_rect.size.x >= 1.0 and region_rect.size.y >= 1.0:
+			x0 = int(region_rect.position.x)
+			y0 = int(region_rect.position.y)
+			w = int(min(region_rect.size.x, img.get_width() - x0))
+			h = int(min(region_rect.size.y, img.get_height() - y0))
+		if w >= 1 and h >= 1:
+			img.lock()
+			var step_x = int(max(1, w / 64))
+			var vmin = -1
+			var vmax = -1
+			for yy in range(h):
+				var xx = 0
+				while xx < w:
+					if img.get_pixel(x0 + xx, y0 + yy).a > 0.1:
+						if vmin < 0:
+							vmin = yy
+						vmax = yy
+						break
+					xx += step_x
+			img.unlock()
+			if vmin >= 0:
+				res = [float(vmin) / float(h), float(vmax + 1) / float(h)]
+	_tex_vband_cache[key] = res
+	return res
+
+# Direction de clip effective pour la silhouette : BOTH quand le crop est actif (la
+# silhouette reste complète, le masque de sortie fait la sélection -> opacité de Both).
+func _silhouette_clip_dir(radial) -> int:
+	if radial == null:
+		return ShadowDirection.BOTH
+	if radial.get("crop", false):
+		return ShadowDirection.BOTH
+	return int(radial.get("dir", ShadowDirection.BOTH))
+
+# Signe de l'orientation UV.y du sprite vs la +normale du mur (+1 : la moitié UV.y>0.5
+# est du côté +normale). 0 si dégénéré (sprite parallèle au mur).
+func _sprite_uvy_sign(clone, wall_normal) -> float:
+	var uvy_dir = clone.transform.basis_xform(Vector2(0.0, -1.0 if clone.flip_v else 1.0))
+	var d = uvy_dir.dot(wall_normal)
+	if abs(d) < 0.0001:
+		return 0.0
+	return sign(d)
+
+# Étirement d'un sprite silhouette (endcap/portail), NORMALISÉ PAR CONTENU : l'étendue
+# OPAQUE du sprite (scan alpha, cache) est calée, de part et d'autre de la LIGNE
+# CENTRALE DU MUR (`wall_point` projeté dans le repère du sprite), sur la bande VISIBLE
+# du mur (étendue opaque de SA texture x facteurs radiaux f_out/f_in). L'ombre du
+# portail remplit donc exactement la bande d'ombre du mur, quel que soit le padding
+# transparent des textures (palissade, porte fine...). Le clip Side A/B est ancré à la
+# ligne du mur (anchor_v). Convention Line2D (cf. strip) : UV.y=1 au bord +normale.
+func _apply_sprite_radial_stretch(mat, clone, wall_normal, radial, wall_point, wall_tex, wall_width):
+	if radial == null:
+		return
+	var s = _sprite_uvy_sign(clone, wall_normal)
+	if s == 0.0:
+		return
+	var rect = clone.get_rect()
+	if rect.size.y < 0.001 or wall_width < 1.0:
+		return
+	# Ancre : ligne centrale du mur dans le repère local du sprite, puis en UV.
+	var anchor_y = clone.transform.affine_inverse().xform(wall_point).y
+	anchor_y = clamp(anchor_y, rect.position.y, rect.position.y + rect.size.y)
+	var anchor_v = (anchor_y - rect.position.y) / rect.size.y
+	if clone.flip_v:
+		anchor_v = 1.0 - anchor_v
+	mat.set_shader_param("tex_center_y", anchor_y)
+	mat.set_shader_param("anchor_v", anchor_v)
+	# Bande visible du mur, par côté de sa ligne centrale (texture nulle = pleine largeur).
+	var wb = _texture_vband(wall_tex)
+	var d_out = max(wb[1] - 0.5, 0.02) * wall_width   # côté +normale (UV.y=1)
+	var d_in = max(0.5 - wb[0], 0.02) * wall_width    # côté -normale (UV.y=0)
+	# Étendue opaque du sprite par côté de l'ancre, en unités locales (UV flip-aware).
+	var sb = _texture_vband(clone.texture, clone.region_enabled, clone.region_rect)
+	var sv0 = sb[0]
+	var sv1 = sb[1]
+	if clone.flip_v:
+		var tmp = sv0
+		sv0 = 1.0 - sv1
+		sv1 = 1.0 - tmp
+	var ext_b = max(sv1 - anchor_v, 0.01) * rect.size.y
+	var ext_a = max(anchor_v - sv0, 0.01) * rect.size.y
+	# Échelle locale -> monde le long de la normale (le clone peut être scalé).
+	var yscale = clone.transform.basis_xform(Vector2(0, 1)).length()
+	if yscale < 0.0001:
+		return
+	var fac = _radial_side_factors(radial)
+	var t_out = d_out * fac[0]
+	var t_in = d_in * fac[1]
+	var stretch_b = (t_out if s > 0.0 else t_in) / (ext_b * yscale)
+	var stretch_a = (t_in if s > 0.0 else t_out) / (ext_a * yscale)
+	stretch_a = clamp(stretch_a, 0.02, 50.0)
+	stretch_b = clamp(stretch_b, 0.02, 50.0)
+	mat.set_shader_param("stretch_a", stretch_a)
+	mat.set_shader_param("stretch_b", stretch_b)
+	mat.set_shader_param("quad_scale", max(1.0, max(stretch_a, stretch_b)))
+
+func _radial_side_factors(radial) -> Array:
+	var r = radial.get("r", 0.0) if radial != null else 0.0
+	var b = radial.get("b", 0.0) if radial != null else 0.0
+	var f_out = max(0.0, (1.0 - r) * (1.0 + max(0.0, b)))
+	var f_in = max(0.0, (1.0 + r) * (1.0 + max(0.0, -b)))
+	# L'extérieur ressort plus que l'intérieur (bridé aux coins par l'anti-repli). On retire
+	# légèrement son excédent (>1) pour rééquilibrer les deux sens.
+	if f_out > 1.0:
+		f_out = 1.0 + (f_out - 1.0) * REALISTIC_OUTER_GAIN
+	return [f_out, f_in]
+
+func _radial_extent_factor(radial) -> float:
+	if radial == null:
+		return 1.0
+	var f = _radial_side_factors(radial)
+	return max(1.0, max(f[0], f[1]))
+
+func _free_realistic_nodes(nodes):
+	if nodes is Array:
+		for n in nodes:
+			if is_instance_valid(n):
+				if n.get_parent() != null:
+					n.get_parent().remove_child(n)
+				n.free()
+
+# Anti-doublons : supprime tout sprite realistic résiduel de CE mur (sauf `keep`). Couvre
+# le cas own-wall (enfants du Line2D) et below-all (enfants du conteneur, filtrés par id mur).
+# Pour chaque point beveled, sa longueur d'arc le long du tracé BRUT (projection sur le
+# segment brut le plus proche) -> l'UV suit la longueur du mur (à travers les sommets),
+# pas celle raccourcie du contour arrondi -> motif calé, pas de déphasage aux coins.
+func _raw_arclen_map(bpts, rpts, closed) -> Array:
+	var rn = rpts.size()
+	var out = []
+	if rn < 2:
+		for _b in bpts:
+			out.append(0.0)
+		return out
+	var rcum = [0.0]
+	var acc = 0.0
+	for i in range(1, rn):
+		acc += rpts[i].distance_to(rpts[i - 1])
+		rcum.append(acc)
+	var seg_count = rn if closed else rn - 1
+	for bp in bpts:
+		var best_d = 1e20
+		var best_u = 0.0
+		for i in range(seg_count):
+			var a = rpts[i]
+			var b = rpts[(i + 1) % rn]
+			var ab = b - a
+			var abl2 = ab.length_squared()
+			var t = 0.0
+			if abl2 > 0.000001:
+				t = clamp((bp - a).dot(ab) / abl2, 0.0, 1.0)
+			var proj = a + ab * t
+			var d = bp.distance_squared_to(proj)
+			if d < best_d:
+				best_d = d
+				best_u = rcum[i] + t * ab.length()
+		out.append(best_u)
+	return out
+
+func _build_silhouette_strip(line, bulge, radial, closed, bitmap_map = null) -> ArrayMesh:
+	var mesh = ArrayMesh.new()
+	var raw_pts = line.points
+	if bulge != null:
+		raw_pts = _bulge_disp_from(raw_pts, bulge)
+	# Arrondit les coins secs (comme la densité de points d'un path) : sinon la normale
+	# au sommet unique pince (unit) ou cisaille (miter) la texture. Le bevel répartit.
+	var pts = _bevel_points_for_both(raw_pts, closed)
+	var n = pts.size()
+	if n < 2:
+		return mesh
+	# UV en U basé sur la longueur d'arc des points BRUTS (à travers le sommet, comme DD),
+	# projetée sur les points beveled -> forme arrondie mais motif calé sur le mur (pas de
+	# déphasage cumulé aux coins).
+	var u_map = _raw_arclen_map(pts, raw_pts, closed)
+	var normals = calculate_point_normals(pts, closed)
+	if normals.size() != n:
+		return mesh
+	var base_half = line.width * 0.5
+	var fac = _radial_side_factors(radial)
+	var f_out = fac[0]   # côté extérieur (+normale)
+	var f_in = fac[1]    # côté intérieur (-normale)
+	# Grow/Shrink (ModifyPaths) : DD expose les largeurs PAR-POINT dans "widths". Si
+	# présentes (et alignées sur les points) ET Grow/Shrink actif, la demi-largeur suit
+	# le tapering ; sinon largeur uniforme. Le double contrôle évite d'appliquer un
+	# "widths" périmé laissé par DD après désactivation. bh_arr[i] = demi-largeur locale.
+	var gs_grow = line.get("Grow")
+	var gs_shrink = line.get("Shrink")
+	var gs_on = (gs_grow is bool and gs_grow) or (gs_shrink is bool and gs_shrink)
+	var pw = line.get("widths")
+	var has_pw = gs_on and pw != null and pw.size() == n
+	var u_period = base_half * 2.0
+	if line.texture != null and line.texture.get_width() > 0:
+		u_period = float(line.texture.get_width())
+	if u_period <= 0.0:
+		u_period = 1.0
+	# Boucle : DD ajuste le tiling pour un nombre ENTIER de tuiles sur le périmètre
+	# (normalizeUV) -> la couture tombe juste. On fait pareil pour éviter le décalage.
+	if closed and raw_pts.size() >= 2:
+		var _rt = 0.0
+		for _i in range(1, raw_pts.size()):
+			_rt += raw_pts[_i].distance_to(raw_pts[_i - 1])
+		_rt += raw_pts[raw_pts.size() - 1].distance_to(raw_pts[0])
+		if _rt > 0.0:
+			u_period = _rt / max(1.0, round(_rt / u_period))
+
+	# Plafonnement au rayon de courbure : SEUL le côté CONCAVE (intérieur du virage)
+	# peut se replier. Le côté convexe (extérieur) ne se replie jamais et ne doit PAS
+	# être écrasé -> on ne clampe que le côté tourné vers le centre de courbure.
+	var half_out = []
+	var half_in = []
+	var bh_arr = []
+	for i in range(n):
+		var bh = (float(pw[i]) * 0.5) if has_pw else base_half
+		bh_arr.append(bh)
+		var raw_out = bh * f_out
+		var raw_in = bh * f_in
+		var cap_out = raw_out + bh + 1.0   # plafond large = pas de clamp
+		var cap_in = raw_in + bh + 1.0
+		var has_prev = closed or i > 0
+		var has_next = closed or i < n - 1
+		if has_prev and has_next:
+			var ip = ((i - 1 + n) % n) if closed else (i - 1)
+			var inx = ((i + 1) % n) if closed else (i + 1)
+			var pa = pts[ip]
+			var pb = pts[i]
+			var pc = pts[inx]
+			var area2 = abs((pb - pa).cross(pc - pa))
+			var ab = (pb - pa).length()
+			var bc = (pc - pb).length()
+			var ca = (pa - pc).length()
+			if area2 > 0.001 and ab > 0.001 and bc > 0.001 and ca > 0.001:
+				var safe = REALISTIC_FOLD_SAFETY * (ab * bc * ca) / (2.0 * area2)
+				var d_in = (pb - pa).normalized()
+				var d_out = (pc - pb).normalized()
+				var curv = d_out - d_in
+				if curv.length() > 0.0001:
+					var to_center = curv.normalized()
+					var nrmi = normals[i]
+					if nrmi.length() > 0.0001:
+						nrmi = nrmi.normalized()
+					if to_center.dot(nrmi) > 0.0:
+						cap_out = safe
+					else:
+						cap_in = safe
+		half_out.append(min(raw_out, cap_out))
+		half_in.append(min(raw_in, cap_in))
+
+	for _pass in range(2):
+		half_out = _smooth_half_array(half_out, n, closed)
+		half_in = _smooth_half_array(half_in, n, closed)
+
+	var verts = PoolVector2Array()
+	var uvs = PoolVector2Array()
+	# Mode bitmap (boucle) : la texture vient d'un rendu hors-écran du Line2D NATUREL
+	# (tiling exact de DD). On échantillonne ce bitmap PAR POSITION : chaque bord du
+	# ruban lit la position du bord NATUREL (+-base_half) -> la géométrie s'étire mais le
+	# tiling reste celui de DD. bm_o/bm_c = région monde couverte par le bitmap.
+	var use_bitmap = bitmap_map != null
+	var bm_o = bitmap_map.get("origin", Vector2.ZERO) if use_bitmap else Vector2.ZERO
+	var bm_c = bitmap_map.get("content", Vector2.ONE) if use_bitmap else Vector2.ONE
+	if bm_c.x <= 0.0:
+		bm_c.x = 1.0
+	if bm_c.y <= 0.0:
+		bm_c.y = 1.0
+	# Direction (clip d'un côté) : OUTER (Side A) ne garde que la moitié +normale, INNER
+	# (Side B) la moitié -normale, BOTH garde tout. Le bord rabattu vient au centre du
+	# trait (position = pts[i], V = 0.5 -> milieu de la texture).
+	var dir_clip = int(radial.get("dir", ShadowDirection.BOTH)) if radial != null else ShadowDirection.BOTH
+	# Crop actif : silhouette COMPLÈTE (la sélection du côté se fait au masque de sortie)
+	# -> le flou a autant de matière qu'en Both, l'opacité près du mur est identique.
+	if radial != null and radial.get("crop", false):
+		dir_clip = ShadowDirection.BOTH
+	var keep_out = dir_clip != ShadowDirection.INNER
+	var keep_in = dir_clip != ShadowDirection.OUTER
+	var cum = 0.0
+	for i in range(n):
+		if i > 0:
+			cum += pts[i].distance_to(pts[i - 1])
+		var nrm = normals[i]
+		if nrm.length() > 0.0001:
+			nrm = nrm.normalized()
+		var ho = half_out[i] if keep_out else 0.0
+		var hi = half_in[i] if keep_in else 0.0
+		verts.append(pts[i] + nrm * ho)
+		verts.append(pts[i] - nrm * hi)
+		if use_bitmap:
+			var so = bh_arr[i] if keep_out else 0.0
+			var si = bh_arr[i] if keep_in else 0.0
+			uvs.append((pts[i] + nrm * so - bm_o) / bm_c)
+			uvs.append((pts[i] - nrm * si - bm_o) / bm_c)
+		else:
+			var u = u_map[i] / u_period if i < u_map.size() else cum / u_period
+			# V : bord extérieur (+normale) -> 1, intérieur -> 0 (miroir sinon). Bord
+			# rabattu par la direction -> 0.5 (centre de la texture).
+			var vo = 1.0 if keep_out else 0.5
+			var vi = 0.0 if keep_in else 0.5
+			uvs.append(Vector2(u, vo))
+			uvs.append(Vector2(u, vi))
+
+	var sections = n
+	if closed:
+		cum += pts[n - 1].distance_to(pts[0])
+		var nrm0 = normals[0]
+		if nrm0.length() > 0.0001:
+			nrm0 = nrm0.normalized()
+		var ho0 = half_out[0] if keep_out else 0.0
+		var hi0 = half_in[0] if keep_in else 0.0
+		verts.append(pts[0] + nrm0 * ho0)
+		verts.append(pts[0] - nrm0 * hi0)
+		if use_bitmap:
+			var so0 = bh_arr[0] if keep_out else 0.0
+			var si0 = bh_arr[0] if keep_in else 0.0
+			uvs.append((pts[0] + nrm0 * so0 - bm_o) / bm_c)
+			uvs.append((pts[0] - nrm0 * si0 - bm_o) / bm_c)
+		else:
+			var raw_total = 0.0
+			for _ri in range(1, raw_pts.size()):
+				raw_total += raw_pts[_ri].distance_to(raw_pts[_ri - 1])
+			if raw_pts.size() >= 2:
+				raw_total += raw_pts[raw_pts.size() - 1].distance_to(raw_pts[0])
+			var u0 = raw_total / u_period
+			var vo0 = 1.0 if keep_out else 0.5
+			var vi0 = 0.0 if keep_in else 0.5
+			uvs.append(Vector2(u0, vo0))
+			uvs.append(Vector2(u0, vi0))
+		sections = n + 1
+
+	var indices = PoolIntArray()
+	for s in range(sections - 1):
+		var a_out = s * 2
+		var a_in = s * 2 + 1
+		var b_out = (s + 1) * 2
+		var b_in = (s + 1) * 2 + 1
+		indices.append(a_out)
+		indices.append(a_in)
+		indices.append(b_out)
+		indices.append(b_out)
+		indices.append(a_in)
+		indices.append(b_in)
+
+	if verts.size() < 3 or indices.size() < 3:
+		return mesh
+	var arrays = []
+	arrays.resize(ArrayMesh.ARRAY_MAX)
+	arrays[ArrayMesh.ARRAY_VERTEX] = verts
+	arrays[ArrayMesh.ARRAY_TEX_UV] = uvs
+	arrays[ArrayMesh.ARRAY_INDEX] = indices
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return mesh
+
+# Lissage 5-tap d'un tableau de demi-largeurs (boucle ou bornes).
+
+func _smooth_half_array(arr: Array, n: int, closed: bool) -> Array:
+	var out = []
+	for i in range(n):
+		var acc = 0.0
+		var cnt = 0
+		for k in range(-2, 3):
+			var j = i + k
+			if closed:
+				j = (j + n) % n
+			else:
+				j = int(clamp(j, 0, n - 1))
+			acc += arr[j]
+			cnt += 1
+		out.append(acc / float(cnt))
+	return out
+
+# Nœud silhouette : Line2D (cas normal) ou MeshInstance2D ruban texturé (radial/side
+# balance actif, pour découpler épaisseur et tiling). bake = true -> shader silhouette
+# blanche (alpha) pour la capture viewport ; bake = false -> shader teinté (ombre nette).
+
+func _get_silhouette_bake_shader() -> Shader:
+	if _silhouette_bake_shader != null:
+		return _silhouette_bake_shader
+	var sh = Shader.new()
+	sh.code = """
+shader_type canvas_item;
+render_mode blend_mix;
+uniform sampler2D tex;
+uniform bool tiled = true;
+// Compatibilité ModifyPaths (n'agit qu'en mode tiled / path ouvert ; en mode bitmap
+// de boucle, ces effets sont déjà cuits dans la texture capturée).
+uniform float start_point = 0.0;
+uniform bool path_flip_vertical = false;
+uniform bool FadeIn = false;
+uniform bool FadeOut = false;
+uniform float path_length_in_uv = 0.0;
+uniform float fade_distance = 10.0;
+void fragment() {
+	float a;
+	if (tiled) {
+		float orig_x = UV.x;
+		float vy = path_flip_vertical ? clamp(1.0 - UV.y, 0.0, 1.0) : clamp(UV.y, 0.0, 1.0);
+		a = texture(tex, vec2(fract(orig_x + start_point), vy)).a;
+		if (path_length_in_uv > 0.0) {
+			float f_dist = 0.01 * fade_distance * path_length_in_uv;
+			if (FadeIn && orig_x < f_dist) { a *= clamp(orig_x / f_dist, 0.0, 1.0); }
+			if (FadeOut && orig_x > path_length_in_uv - f_dist) { a *= 1.0 - clamp((orig_x - (path_length_in_uv - f_dist)) / f_dist, 0.0, 1.0); }
+		}
+	} else {
+		a = texture(tex, clamp(UV, vec2(0.0), vec2(1.0))).a;
+	}
+	COLOR = vec4(1.0, 1.0, 1.0, a);
+}
+"""
+	_silhouette_bake_shader = sh
+	return sh
+
+# Shader silhouette teintée (ombre nette directe).
+var _silhouette_tint_shader = null
+
+
+# Entrée du mode realistic (statique). Silhouette = clones des Line2D du mur (rendu
+# exact de DD, trous de portails inclus) capturés dans un viewport, puis Sprite
+# décalé + (net : modulé | flou : shader polaire), rendu sous le mur.
+func create_realistic_shadow_wall(path, config: Dictionary, line):
+	if line == null:
+		line = get_line2d(path)
+	if line == null or not is_instance_valid(line):
+		return
+
+	# Segments visuels du mur (Line2D, déjà coupés autour des portails par DD). On ne
+	# filtre PAS sur .texture : DD texture souvent via un material -> .texture = null. La
+	# silhouette = la FORME du Line2D (largeur), alpha via la texture si présente sinon plein.
+	var tex_width = 0.0
+	for ci in range(path.get_child_count()):
+		var ch = path.get_child(ci)
+		if ch is Line2D and ch.get_point_count() >= 2 and ch.width > tex_width:
+			tex_width = ch.width
+	var segments = []
+	for ci2 in range(path.get_child_count()):
+		var ch2 = path.get_child(ci2)
+		if ch2 is Line2D and ch2.get_point_count() >= 2 and abs(ch2.width - tex_width) < 0.01:
+			segments.append(ch2)
+	if segments.size() == 0 or tex_width < 1.0:
+		return
+
+	var opacity = config.get("opacity_realistic", config.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"]))
+	var shadow_color = config.get("shadow_color", Color(0, 0, 0, 1))
+	if shadow_color is String:
+		shadow_color = Color(shadow_color)
+	var below_all = config.get("below_all_walls", false)
+	# Le rayon de flou est piloté par le slider Blur dédié (0..1 -> 0..REALISTIC_BLUR_MAX_PX).
+	var blur_px = _realistic_blur_px_from_frac(config.get("realistic_blur", DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2)))
+	var do_blur = blur_px >= REALISTIC_MIN_BLUR_PX
+	var radial = _make_radial(config)
+
+	# Parenting (même modèle que l'ombre simple : sous son mur, ou conteneur below-all).
+	var shadow_parent = _get_wall_r_wrapper(line)
+	var line_global_xform = line.global_transform
+	var wall_nid = str(path.get_meta("node_id")) if path.has_meta("node_id") else ""
+	if below_all:
+		var ba = _get_below_all_container(line)
+		if ba != null:
+			shadow_parent = ba
+	var offset = Vector2(config.get("offset_x", 0.0), config.get("offset_y", 0.0))
+	if line.rotation != 0.0:
+		offset = offset.rotated(-line.rotation)
+
+	var nid = path.get_instance_id()
+	var gen = _realistic_gen.get(nid, 0) + 1
+	_realistic_gen[nid] = gen
+	_wall_r_capturing[nid] = gen   # le monitor saute ce mur tant que cette capture est en vol
+
+	# bbox de tous les points des segments, en espace LINE-local.
+	var line_inv = line.global_transform.affine_inverse()
+	var seg_xf = []
+	var have = false
+	var minp = Vector2.ZERO
+	var maxp = Vector2.ZERO
+	for seg in segments:
+		var xf = line_inv * seg.global_transform
+		seg_xf.append(xf)
+		for p in seg.points:
+			var lp = xf.xform(p)
+			if not have:
+				minp = lp
+				maxp = lp
+				have = true
+			else:
+				minp.x = min(minp.x, lp.x)
+				minp.y = min(minp.y, lp.y)
+				maxp.x = max(maxp.x, lp.x)
+				maxp.y = max(maxp.y, lp.y)
+	if not have:
+		return
+	var margin = tex_width * _radial_extent_factor(radial)
+	var origin = minp - Vector2(margin, margin)
+	var content = (maxp - minp) + Vector2(2.0 * margin, 2.0 * margin)
+	if content.x < 1.0 or content.y < 1.0:
+		return
+	var scale_f = REALISTIC_VP_DOWNSAMPLE
+	var big = max(content.x, content.y)
+	if big * scale_f > REALISTIC_VP_MAX_DIM:
+		scale_f = REALISTIC_VP_MAX_DIM / big
+	var vp_size = Vector2(max(ceil(content.x * scale_f), 1.0), max(ceil(content.y * scale_f), 1.0))
+	var base_pos = origin + content * 0.5
+
+	# Viewport : clone chaque segment (shader silhouette) dans un conteneur mis à l'échelle.
+	var vp = Viewport.new()
+	vp.size = vp_size
+	vp.transparent_bg = true
+	vp.usage = Viewport.USAGE_2D
+	vp.disable_3d = true
+	vp.hdr = false
+	vp.render_target_v_flip = false
+	vp.render_target_update_mode = Viewport.UPDATE_ONCE
+	var container = Node2D.new()
+	container.scale = Vector2(scale_f, scale_f)
+	container.position = -origin * scale_f
+	vp.add_child(container)
+	# Boucle + radial : bitmap de la texture NATURELLE (phase DD exacte). CACHÉ par hash de
+	# points -> une seule capture tant que la géométrie ne change pas (radial/offset/couleur
+	# ne l'invalident pas) -> pas de re-render à chaque réglage.
+	var loop_bitmap = null
+	if radial != null and is_path_closed(path) and segments.size() == 1:
+		var lsig = _get_points_hash(path)
+		if _wall_loop_nat.has(nid) and _wall_loop_nat[nid].get("sig") == lsig and _wall_loop_nat[nid].get("tex") != null:
+			loop_bitmap = _wall_loop_nat[nid]
+		else:
+			var gn = _wall_r_geom(path, line, 1.0)   # région fixe (non-radiale) -> cachable
+			if gn != null:
+				var nvps = Vector2(max(ceil(gn["content"].x * gn["scale_f"]), 1.0), max(ceil(gn["content"].y * gn["scale_f"]), 1.0))
+				var pvp = Viewport.new()
+				pvp.size = nvps
+				pvp.transparent_bg = true
+				pvp.usage = Viewport.USAGE_2D
+				pvp.disable_3d = true
+				pvp.hdr = false
+				pvp.render_target_v_flip = false
+				pvp.render_target_update_mode = Viewport.UPDATE_ONCE
+				var pcont = Node2D.new()
+				pcont.scale = Vector2(gn["scale_f"], gn["scale_f"])
+				pcont.position = -gn["origin"] * gn["scale_f"]
+				pvp.add_child(pcont)
+				var nat = segments[0].duplicate(0)
+				for nc in nat.get_children():
+					nc.free()
+				nat.set("Loop", true)
+				nat.transform = seg_xf[0]
+				nat.default_color = Color(1, 1, 1, 1)
+				var nmat = ShaderMaterial.new()
+				nmat.shader = _get_wall_silhouette_shader()
+				nat.material = nmat
+				pcont.add_child(nat)
+				line.add_child(pvp)
+				yield(global.Editor.get_tree(), "idle_frame")
+				yield(global.Editor.get_tree(), "idle_frame")
+				if _realistic_gen.get(nid, -1) != gen or not is_instance_valid(path) or not is_instance_valid(line) or not is_instance_valid(pvp):
+					if is_instance_valid(pvp):
+						pvp.queue_free()
+					if _wall_r_capturing.get(nid, -1) == gen:
+						_wall_r_capturing.erase(nid)
+					return
+				var pimg = pvp.get_texture().get_data()
+				pvp.queue_free()
+				if pimg != null:
+					pimg.flip_y()
+					var ptex = ImageTexture.new()
+					ptex.create_from_image(pimg, Texture.FLAG_FILTER)
+					loop_bitmap = {"tex": ptex, "origin": gn["origin"], "content": gn["content"], "sig": lsig}
+					_wall_loop_nat[nid] = loop_bitmap
+	_populate_wall_r_container(container, path, segments, seg_xf, line_inv, radial, loop_bitmap)
+	# Crop Blur (Side A/B) et/ou Crop Ends : viewport masque aligné, capturé dans les
+	# MÊMES idle frames.
+	var _side_crop = _wall_crop_active(config) and do_blur
+	var _ends_crop = config.get("crop_ends", false) and do_blur
+	var mvp = null
+	if _side_crop or _ends_crop:
+		var mres = _make_wall_crop_viewport(vp, container, path, segments, seg_xf, line_inv,
+			int(config.get("direction", ShadowDirection.BOTH)),
+			_wall_crop_reach(blur_px, tex_width), false, Viewport.UPDATE_ONCE, _side_crop, _ends_crop)
+		mvp = mres[0]
+	line.add_child(vp)
+
+	yield(global.Editor.get_tree(), "idle_frame")
+	yield(global.Editor.get_tree(), "idle_frame")
+
+	if _realistic_gen.get(nid, -1) != gen or not is_instance_valid(path) or not is_instance_valid(line) or not is_instance_valid(vp):
+		if _wall_r_capturing.get(nid, -1) == gen:
+			_wall_r_capturing.erase(nid)
+		if is_instance_valid(vp):
+			vp.queue_free()
+		return
+	var img = vp.get_texture().get_data()
+	# Readback du masque AVANT le queue_free du viewport principal (mvp en est l'enfant).
+	var mask_tex = null
+	if mvp != null and is_instance_valid(mvp):
+		var mimg = mvp.get_texture().get_data()
+		if mimg != null:
+			mimg.flip_y()
+			mask_tex = ImageTexture.new()
+			mask_tex.create_from_image(mimg, Texture.FLAG_FILTER)
+	vp.queue_free()
+	if img == null:
+		if _wall_r_capturing.get(nid, -1) == gen:
+			_wall_r_capturing.erase(nid)
+		return
+	img.flip_y()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, Texture.FLAG_MIPMAPS | Texture.FLAG_FILTER)
+
+
+	# Réutilise le sprite existant s'il y en a un (jamais deux -> pas de duplication). On
+	# libère d'abord tout autre nœud d'ombre de ce mur (mesh simple, sprites traînards).
+	var spr = null
+	var old_nodes = path.get_meta(SHADOW_META_KEY) if path.has_meta(SHADOW_META_KEY) else null
+	if old_nodes is Array:
+		for n in old_nodes:
+			if is_instance_valid(n) and (n is Sprite) and spr == null:
+				spr = n   # on garde le premier sprite pour le réutiliser
+			elif is_instance_valid(n):
+				if n.get_parent() != null:
+					n.get_parent().remove_child(n)
+				n.free()
+	if spr == null:
+		spr = Sprite.new()
+	spr.name = "DropShadowRealistic"
+	spr.texture = tex
+	spr.centered = true
+	spr.z_as_relative = true
+	spr.set_meta("_wall_r_owner", nid)   # tag propriétaire -> purge exhaustive fiable
+	var mat = spr.material if spr.material is ShaderMaterial else ShaderMaterial.new()
+	mat.shader = _get_realistic_vp_blur_shader()
+	spr.material = mat
+	_apply_wall_r_params(mat, vp_size, blur_px, scale_f, shadow_color, opacity)
+	_apply_wall_crop_params(mat, mask_tex)
+	mat.set_shader_param("alpha_gain", _crop_alpha_gain(radial))
+	if spr.get_parent() == null:
+		shadow_parent.add_child(spr)
+	elif spr.get_parent() != shadow_parent:
+		spr.get_parent().remove_child(spr)
+		shadow_parent.add_child(spr)
+	_place_wall_r_sprite(spr, shadow_parent, line, line_global_xform, base_pos, offset, scale_f)
+	if shadow_parent != line and wall_nid != "":
+		spr.set_meta("_ba_wall_id", wall_nid)
+	path.set_meta(SHADOW_META_KEY, [spr])
+	_purge_wall_r_sprites(path, line, nid, spr)
+	# Le bake statique vient de donner au sprite une texture mipmappée : si une session
+	# live existait, on libère son viewport persistant (le sprite ne le lit plus).
+	if _wall_r_session.has(nid):
+		var _sess = _wall_r_session[nid]
+		_wall_r_session.erase(nid)
+		_wall_r_last_req.erase(nid)
+		if is_instance_valid(_sess["vp"]):
+			_sess["vp"].queue_free()
+	_wall_r_live[nid] = {"sprite": spr, "vp_size": vp_size, "scale_f": scale_f, "base_pos": base_pos, "parent": shadow_parent, "line": line, "line_xform": line_global_xform}
+	if _wall_r_capturing.get(nid, -1) == gen:
+		_wall_r_capturing.erase(nid)
+
+
+# Géométrie realistic du mur : segments, transforms, bbox, échelle. margin_factor fixe
+# (2.0 pour la session live -> couvre tout radial sans resize).
+func _wall_r_geom(path, line, margin_factor):
+	var tex_width = 0.0
+	for ci in range(path.get_child_count()):
+		var ch = path.get_child(ci)
+		if ch is Line2D and ch.get_point_count() >= 2 and ch.width > tex_width:
+			tex_width = ch.width
+	var segments = []
+	for ci2 in range(path.get_child_count()):
+		var ch2 = path.get_child(ci2)
+		if ch2 is Line2D and ch2.get_point_count() >= 2 and abs(ch2.width - tex_width) < 0.01:
+			segments.append(ch2)
+	if segments.size() == 0 or tex_width < 1.0:
+		return null
+	var line_inv = line.global_transform.affine_inverse()
+	var seg_xf = []
+	var have = false
+	var minp = Vector2.ZERO
+	var maxp = Vector2.ZERO
+	for seg in segments:
+		var xf = line_inv * seg.global_transform
+		seg_xf.append(xf)
+		for p in seg.points:
+			var lp = xf.xform(p)
+			if not have:
+				minp = lp
+				maxp = lp
+				have = true
+			else:
+				minp.x = min(minp.x, lp.x)
+				minp.y = min(minp.y, lp.y)
+				maxp.x = max(maxp.x, lp.x)
+				maxp.y = max(maxp.y, lp.y)
+	if not have:
+		return null
+	var margin = tex_width * margin_factor
+	var origin = minp - Vector2(margin, margin)
+	var content = (maxp - minp) + Vector2(2.0 * margin, 2.0 * margin)
+	if content.x < 1.0 or content.y < 1.0:
+		return null
+	var scale_f = REALISTIC_VP_DOWNSAMPLE
+	var big = max(content.x, content.y)
+	if big * scale_f > REALISTIC_VP_MAX_DIM:
+		scale_f = REALISTIC_VP_MAX_DIM / big
+	return {"tex_width": tex_width, "segments": segments, "seg_xf": seg_xf, "line_inv": line_inv, "origin": origin, "content": content, "scale_f": scale_f, "base_pos": origin + content * 0.5}
+
+# Démarre une session LIVE : viewport persistant (UPDATE_ALWAYS) dont le sprite lit
+# directement la ViewportTexture -> radial/side se voient en direct, sans readback.
+func _start_wall_r_session(path, line, shadow_parent, line_global_xform, wall_nid, radial, offset, shadow_color, opacity, blur_px):
+	var nid = path.get_instance_id()
+	var g = _wall_r_geom(path, line, 2.0)
+	# Session sans mips : plafonne l'échelle pour que le rayon de flou tienne dans les
+	# anneaux (pas de sous-échantillonnage -> couleur non ternie). Le flou masque la basse déf.
+	if blur_px > 0.5 and g != null:
+		g["scale_f"] = min(g["scale_f"], float(REALISTIC_BLUR_QUALITY) / blur_px)
+	if g == null:
+		return
+	# Viewport CARRÉ (dimension max) : la bbox axis-aligned grossit à la rotation, un carré
+	# couvre n'importe quel angle sans clip. Plafonné à la résolution max.
+	var _big = max(g["content"].x, g["content"].y) * g["scale_f"] * WALL_R_LIVE_HEADROOM
+	_big = min(_big, REALISTIC_VP_MAX_DIM)
+	var tsize = Vector2(max(ceil(_big), 1.0), max(ceil(_big), 1.0))
+	var vp = Viewport.new()
+	vp.size = tsize
+	vp.transparent_bg = true
+	vp.usage = Viewport.USAGE_2D
+	vp.disable_3d = true
+	vp.hdr = false
+	vp.render_target_v_flip = true
+	vp.render_target_update_mode = Viewport.UPDATE_ALWAYS
+	var container = Node2D.new()
+	container.scale = Vector2(g["scale_f"], g["scale_f"])
+	container.position = tsize * 0.5 - g["base_pos"] * g["scale_f"]
+	vp.add_child(container)
+	_populate_wall_r_container(container, path, g["segments"], g["seg_xf"], g["line_inv"], radial, _wall_loop_nat.get(path.get_instance_id()))
+	# Crop Blur et/ou Crop Ends : masque persistant (UPDATE_ALWAYS) aligné sur le viewport de session.
+	var crop_on = radial != null and radial.get("crop", false) and int(radial.get("dir", ShadowDirection.BOTH)) != ShadowDirection.BOTH and blur_px >= REALISTIC_MIN_BLUR_PX
+	var ends_on = _wall_cfg_crop_ends(path) and blur_px >= REALISTIC_MIN_BLUR_PX
+	var mvp = null
+	var mcont = null
+	var mtex = null
+	if crop_on or ends_on:
+		var mres = _make_wall_crop_viewport(vp, container, path, g["segments"], g["seg_xf"], g["line_inv"],
+			int(radial.get("dir")) if radial != null else ShadowDirection.BOTH, _wall_crop_reach(blur_px, g["tex_width"]), true, Viewport.UPDATE_ALWAYS, crop_on, ends_on)
+		mvp = mres[0]
+		mcont = mres[1]
+		mtex = mvp.get_texture()
+		mtex.flags = Texture.FLAG_FILTER
+	line.add_child(vp)
+	var vtex = vp.get_texture()
+	vtex.flags = Texture.FLAG_FILTER
+	var spr = null
+	var old_nodes = path.get_meta(SHADOW_META_KEY) if path.has_meta(SHADOW_META_KEY) else null
+	if old_nodes is Array:
+		for n in old_nodes:
+			if is_instance_valid(n) and (n is Sprite) and spr == null:
+				spr = n
+			elif is_instance_valid(n):
+				if n.get_parent() != null:
+					n.get_parent().remove_child(n)
+				n.free()
+	if spr == null:
+		spr = Sprite.new()
+	spr.name = "DropShadowRealistic"
+	spr.texture = vtex
+	spr.centered = true
+	spr.z_as_relative = true
+	spr.set_meta("_wall_r_owner", nid)
+	var mat = spr.material if spr.material is ShaderMaterial else ShaderMaterial.new()
+	mat.shader = _get_realistic_vp_blur_shader()
+	spr.material = mat
+	_apply_realistic_blur_params(mat, tsize, blur_px, g["scale_f"], shadow_color, opacity, false)
+	_apply_wall_crop_params(mat, mtex)
+	mat.set_shader_param("alpha_gain", _crop_alpha_gain(radial))
+	if spr.get_parent() == null:
+		shadow_parent.add_child(spr)
+	elif spr.get_parent() != shadow_parent:
+		spr.get_parent().remove_child(spr)
+		shadow_parent.add_child(spr)
+	_place_wall_r_sprite(spr, shadow_parent, line, line_global_xform, g["base_pos"], offset, g["scale_f"])
+	if shadow_parent != line and wall_nid != "":
+		spr.set_meta("_ba_wall_id", wall_nid)
+	path.set_meta(SHADOW_META_KEY, [spr])
+	_purge_wall_r_sprites(path, line, nid, spr)
+	_wall_r_session[nid] = {"vp": vp, "container": container, "sprite": spr, "scale_f": g["scale_f"], "base_pos": g["base_pos"], "tsize": tsize, "parent": shadow_parent, "line": line, "line_xform": line_global_xform, "mvp": mvp, "mcont": mcont}
+	_wall_r_last_req[nid] = OS.get_ticks_msec()
+	_wall_r_live.erase(nid)
+
+# Met à jour une session live existante : repopule la silhouette (radial) + params sprite.
+func _update_wall_r_session(nid, path, line, radial, offset, shadow_color, opacity, blur_px):
+	var s = _wall_r_session[nid]
+	if not is_instance_valid(s["sprite"]) or not is_instance_valid(s["vp"]) or not is_instance_valid(s["container"]):
+		_wall_r_session.erase(nid)
+		return false
+	var g = _wall_r_geom(path, line, 2.0)
+	# Session sans mips : plafonne l'échelle pour que le rayon de flou tienne dans les
+	# anneaux (pas de sous-échantillonnage -> couleur non ternie). Le flou masque la basse déf.
+	if blur_px > 0.5 and g != null:
+		g["scale_f"] = min(g["scale_f"], float(REALISTIC_BLUR_QUALITY) / blur_px)
+	if g == null:
+		return true
+	for c in s["container"].get_children():
+		s["container"].remove_child(c)
+		c.free()
+	s["container"].scale = Vector2(g["scale_f"], g["scale_f"])
+	s["container"].position = s["tsize"] * 0.5 - g["base_pos"] * g["scale_f"]
+	_populate_wall_r_container(s["container"], path, g["segments"], g["seg_xf"], g["line_inv"], radial, _wall_loop_nat.get(path.get_instance_id()))
+	# Crop Blur / Crop Ends : synchronise le masque avec l'état courant.
+	var crop_on = radial != null and radial.get("crop", false) and int(radial.get("dir", ShadowDirection.BOTH)) != ShadowDirection.BOTH and blur_px >= REALISTIC_MIN_BLUR_PX
+	var ends_on = _wall_cfg_crop_ends(path) and blur_px >= REALISTIC_MIN_BLUR_PX
+	var need_mask = crop_on or ends_on
+	var mvp = s.get("mvp")
+	var mcont = s.get("mcont")
+	if need_mask and (mvp == null or not is_instance_valid(mvp) or mcont == null or not is_instance_valid(mcont)):
+		# Masque absent de cette session (ex. Both -> Side en cours de session) : on ne peut
+		# pas l'ajouter à chaud -> false, le chemin settle re-bake reconstruit tout (l'ancien
+		# sprite reste affiché entre-temps, pas de flicker).
+		return false
+	if need_mask:
+		for mc in mcont.get_children():
+			mcont.remove_child(mc)
+			mc.free()
+		mcont.scale = s["container"].scale
+		mcont.position = s["container"].position
+		if crop_on:
+			_populate_wall_crop_mask(mcont, path, g["segments"], g["seg_xf"], g["line_inv"], int(radial.get("dir")), _wall_crop_reach(blur_px, g["tex_width"]))
+		if ends_on:
+			_populate_wall_end_crop(mcont, path, g["segments"], g["seg_xf"], g["line_inv"], _wall_crop_reach(blur_px, g["tex_width"]))
+	if s["sprite"].material is ShaderMaterial:
+		_apply_realistic_blur_params(s["sprite"].material, s["tsize"], blur_px, g["scale_f"], shadow_color, opacity, false)
+		if need_mask:
+			_apply_wall_crop_params(s["sprite"].material, mvp.get_texture())
+		else:
+			s["sprite"].material.set_shader_param("crop_enabled", 0.0)
+		s["sprite"].material.set_shader_param("alpha_gain", _crop_alpha_gain(radial))
+	s["scale_f"] = g["scale_f"]
+	s["base_pos"] = g["base_pos"]
+	_place_wall_r_sprite(s["sprite"], s["parent"], line, s["line_xform"], g["base_pos"], offset, g["scale_f"])
+	_wall_r_last_req[nid] = OS.get_ticks_msec()
+	return true
+
+func _populate_wall_r_container(container, path, segments, seg_xf, line_inv, radial, loop_bitmap = null):
+	var seg_closed = is_path_closed(path) and segments.size() == 1
+	var sil = _get_wall_silhouette_shader()
+	for si in range(segments.size()):
+		var seg2 = segments[si]
+		if seg_closed and radial != null and loop_bitmap != null:
+			# Boucle + radial : strip-mesh échantillonnant le BITMAP naturel (phase DD cuite)
+			# par position monde -> le radial déforme la géométrie, la texture reste calée.
+			var strip_b = _build_silhouette_strip(seg2, null, radial, seg_closed, loop_bitmap)
+			if strip_b.get_surface_count() > 0:
+				var mi_b = MeshInstance2D.new()
+				mi_b.mesh = strip_b
+				mi_b.transform = seg_xf[si]
+				var bmat_b = ShaderMaterial.new()
+				bmat_b.shader = _get_silhouette_bake_shader()
+				bmat_b.set_shader_param("tex", loop_bitmap["tex"])
+				bmat_b.set_shader_param("tiled", false)   # échantillonnage direct du bitmap
+				mi_b.material = bmat_b
+				container.add_child(mi_b)
+			continue
+		if seg_closed:
+			# Boucle (sans radial, ou session) : on DUPLIQUE le Line2D du mur (avec Loop)
+			# -> tiling EXACT comme DD.
+			var lclone = seg2.duplicate(0)
+			for lc in lclone.get_children():
+				lc.free()
+			lclone.set("Loop", true)
+			lclone.transform = seg_xf[si]
+			lclone.default_color = Color(1, 1, 1, 1)
+			var lmat = ShaderMaterial.new()
+			lmat.shader = sil
+			lclone.material = lmat
+			container.add_child(lclone)
+			continue
+		if radial != null:
+			# Radial/side (murs ouverts) : ruban-mesh texturé (asymétrie + coins miter).
+			var strip = _build_silhouette_strip(seg2, null, radial, seg_closed)
+			if strip.get_surface_count() > 0:
+				var mi = MeshInstance2D.new()
+				mi.mesh = strip
+				mi.transform = seg_xf[si]
+				var bmat = ShaderMaterial.new()
+				bmat.shader = _get_silhouette_bake_shader()
+				bmat.set_shader_param("tex", seg2.texture)
+				bmat.set_shader_param("tiled", true)
+				mi.material = bmat
+				container.add_child(mi)
+			continue
+		var clone = Line2D.new()
+		clone.points = seg2.points
+		clone.width = seg2.width
+		clone.texture = seg2.texture          # texture du mur -> la silhouette suit sa forme (alpha)
+		clone.texture_mode = seg2.texture_mode
+		clone.joint_mode = seg2.joint_mode
+		clone.begin_cap_mode = seg2.begin_cap_mode
+		clone.end_cap_mode = seg2.end_cap_mode
+		clone.transform = seg_xf[si]
+		clone.default_color = Color(1, 1, 1, 1)
+		var cmat = ShaderMaterial.new()
+		cmat.shader = sil                     # blanc + alpha : sans texture -> plein ; avec -> forme réelle
+		clone.material = cmat
+		container.add_child(clone)
+	# Endcaps : Sprites enfants de CHAQUE segment Line2D (CreateWallEnd, murs ouverts).
+	# On les clone pour que leur forme (EndTexture) apparaisse dans l'ombre. En radial, on
+	# les ÉTIRE depuis le milieu comme le ruban (normale de l'extrémité proche).
+	for si2 in range(segments.size()):
+		var seg3 = segments[si2]
+		var xf3 = seg_xf[si2]
+		var n_first = Vector2(0, 1)
+		var n_last = Vector2(0, 1)
+		var p_first = Vector2.ZERO
+		var p_last = Vector2.ZERO
+		if radial != null and seg3.points.size() >= 2:
+			var nrm3 = calculate_point_normals(seg3.points, seg_closed)
+			p_first = xf3.xform(seg3.points[0])
+			p_last = xf3.xform(seg3.points[seg3.points.size() - 1])
+			if nrm3.size() > 0:
+				n_first = xf3.basis_xform(nrm3[0]).normalized()
+				n_last = xf3.basis_xform(nrm3[nrm3.size() - 1]).normalized()
+		for ei in range(seg3.get_child_count()):
+			var ech = seg3.get_child(ei)
+			if not (ech is Sprite) or ech.texture == null:
+				continue
+			# NE PAS re-capturer notre propre ombre (sprite enfant de la line/segment) :
+			# sinon on la bake dans la nouvelle capture -> bande supplémentaire à chaque passage.
+			if str(ech.name).begins_with("DropShadowRealistic") or ech.has_meta("_wall_r_owner"):
+				continue
+			var ecl = Sprite.new()
+			ecl.texture = ech.texture
+			ecl.centered = ech.centered
+			ecl.offset = ech.offset
+			ecl.flip_h = ech.flip_h
+			ecl.flip_v = ech.flip_v
+			ecl.region_enabled = ech.region_enabled
+			ecl.region_rect = ech.region_rect
+			ecl.transform = line_inv * ech.global_transform
+			var nn_e = Vector2(0, 1)
+			var wp_e = Vector2.ZERO
+			if radial != null:
+				var pos = ecl.transform.origin
+				if pos.distance_to(p_first) <= pos.distance_to(p_last):
+					nn_e = n_first
+					wp_e = p_first
+				else:
+					nn_e = n_last
+					wp_e = p_last
+			ecl.self_modulate = Color(1, 1, 1, 1)
+			var emat = ShaderMaterial.new()
+			emat.shader = sil
+			emat.set_shader_param("clip_side", _sprite_clip_side(ecl, nn_e, _silhouette_clip_dir(radial)))
+			_apply_sprite_radial_stretch(emat, ecl, nn_e, radial, wp_e, seg3.texture, seg3.width)
+			ecl.material = emat
+			container.add_child(ecl)
+	# Portails : ajoute leur forme (sprite) à la silhouette pour les portails NON skippés
+	# (ceux avec une vraie texture porte/fenêtre). Les portails skippés (ouverture nue)
+	# laissent le trou. Comble ainsi le gap du mur avec la forme réelle du portail.
+	var _skip_portals = false
+	var _pnode_id = str(path.get_meta("node_id")) if path.has_meta("node_id") else ""
+	if _pnode_id != "" and global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(_pnode_id):
+		_skip_portals = global.ModMapData[SHADOW_DATA_KEY][_pnode_id].get("skip_portals", false)
+	# Radial/side : normales du mur (en line-local) pour orienter clip et étirement des
+	# portails (étirés depuis le milieu comme le ruban, pas translatés).
+	var _wall_norms = []   # [{p, n}] tous les points du mur en line-local
+	if radial != null and segments.size() > 0:
+		for _si in range(segments.size()):
+			var _sn = calculate_point_normals(segments[_si].points, seg_closed)
+			for _pi in range(segments[_si].points.size()):
+				var _pll = seg_xf[_si].xform(segments[_si].points[_pi])
+				var _nll = seg_xf[_si].basis_xform(_sn[_pi]).normalized() if _pi < _sn.size() else Vector2(0, 1)
+				_wall_norms.append({"p": _pll, "n": _nll})
+	for pci in range(path.get_child_count()):
+		var pc = path.get_child(pci)
+		if not (str(pc.name).begins_with("Portal") or str(pc.name).begins_with("@Portal")):
+			continue
+		if _should_skip_portal(pc, _skip_portals):
+			continue
+		if pc.get_child_count() == 0:
+			continue
+		var psp = pc.get_child(0)
+		if not (psp is Sprite) or psp.texture == null:
+			continue
+		var pcl = Sprite.new()
+		pcl.texture = psp.texture
+		pcl.centered = psp.centered
+		pcl.offset = psp.offset
+		pcl.flip_h = psp.flip_h
+		pcl.flip_v = psp.flip_v
+		pcl.region_enabled = psp.region_enabled
+		pcl.region_rect = psp.region_rect
+		pcl.transform = line_inv * psp.global_transform
+		# Suit le radial : normale + point du mur les plus proches (clip + ancre d'étirement).
+		var nn_p = Vector2(0, 1)
+		var wp_p = Vector2.ZERO
+		if _wall_norms.size() > 0:
+			var ppos = pcl.transform.origin
+			var _best = _wall_norms[0]
+			var _bestd = 1.0e20
+			for wn in _wall_norms:
+				var dd = ppos.distance_squared_to(wn["p"])
+				if dd < _bestd:
+					_bestd = dd
+					_best = wn
+			nn_p = _best["n"]
+			wp_p = _best["p"]
+		pcl.self_modulate = Color(1, 1, 1, 1)
+		var pmat = ShaderMaterial.new()
+		pmat.shader = sil
+		pmat.set_shader_param("clip_side", _sprite_clip_side(pcl, nn_p, _silhouette_clip_dir(radial)))
+		_apply_sprite_radial_stretch(pmat, pcl, nn_p, radial, wp_p, segments[0].texture, segments[0].width)
+		pcl.material = pmat
+		container.add_child(pcl)
+
+# --- Crop Blur (Side A/B, realistic) ---------------------------------------------------
+# Le flou polaire étale la silhouette (pourtant clippée au centre) au-delà de la ligne
+# centrale du mur. Le masque = bande SOLIDE du côté interdit (centre -> reach), capturée
+# dans un 2e viewport aligné sur la capture principale, passée au shader de flou qui
+# discard là où le masque est opaque. Le crop SUIT l'offset X/Y du sprite (même espace
+# texture que la silhouette). Le masque suit la polyligne (coins/courbes), pas un simple
+# demi-plan, est prolongé aux extrémités (endcaps) et ponté aux portails.
+var _crop_tint_shader = null
+# Teinte additive du masque : R = côté interdit, G = côté gardé (protection). blend_add
+# -> les recouvrements saturent, les deux canaux coexistent sur un même pixel.
+func _get_crop_tint_shader() -> Shader:
+	if _crop_tint_shader != null:
+		return _crop_tint_shader
+	var sh = Shader.new()
+	sh.code = """
+shader_type canvas_item;
+render_mode blend_add;
+uniform vec4 tint = vec4(1.0, 0.0, 0.0, 1.0);
+void fragment() {
+	COLOR = tint * COLOR;   // COLOR de vertex = rampe des dégradés (blanc par défaut)
+}
+"""
+	_crop_tint_shader = sh
+	return sh
+
+func _crop_opposite_dir(dir) -> int:
+	return ShadowDirection.INNER if dir == ShadowDirection.OUTER else ShadowDirection.OUTER
+
+func _crop_tint_mat(is_keep) -> ShaderMaterial:
+	var m = ShaderMaterial.new()
+	m.shader = _get_crop_tint_shader()
+	m.set_shader_param("tint", Color(0, 1, 0, 1) if is_keep else Color(1, 0, 0, 1))
+	return m
+
+# Mesh de coupe d'extrémité en DÉGRADÉ : bande centrale = coupe DURE dans l'axe du mur
+# (bleu=1, la "ligne rose"), ailes latérales en rampe 1->0 sur `fade` : la coupe
+# s'estompe là où elle rencontre l'ombre voisine (coin intérieur d'un U...) au lieu
+# d'y tailler un rectangle net.
+func _end_crop_gradient_mesh(c, t, nrm, hard_half, fade, out_len) -> ArrayMesh:
+	var verts = PoolVector2Array()
+	var cols = PoolColorArray()
+	var white = Color(1, 1, 1, 1)
+	var black = Color(0, 0, 0, 1)
+	var bands = [
+		[-hard_half - fade, -hard_half, black, white],
+		[-hard_half, hard_half, white, white],
+		[hard_half, hard_half + fade, white, black],
+	]
+	for b in bands:
+		var v00 = c + nrm * b[0]
+		var v10 = c + nrm * b[1]
+		var v01 = v00 + t * out_len
+		var v11 = v10 + t * out_len
+		verts.append(v00)
+		cols.append(b[2])
+		verts.append(v10)
+		cols.append(b[3])
+		verts.append(v01)
+		cols.append(b[2])
+		verts.append(v10)
+		cols.append(b[3])
+		verts.append(v11)
+		cols.append(b[3])
+		verts.append(v01)
+		cols.append(b[2])
+	var arrays = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_COLOR] = cols
+	var m = ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return m
+
+func _crop_tint_mat_ends() -> ShaderMaterial:
+	var m = ShaderMaterial.new()
+	m.shader = _get_crop_tint_shader()
+	m.set_shader_param("tint", Color(0, 0, 1, 1))   # BLEU = crop absolu (Crop Ends)
+	return m
+
+# crop_ends depuis la config SAUVÉE du mur (les sessions live n'ont pas la config).
+func _wall_cfg_crop_ends(path) -> bool:
+	if path == null or not is_instance_valid(path) or not path.has_meta("node_id"):
+		return false
+	if not global.ModMapData.has(SHADOW_DATA_KEY):
+		return false
+	var d = global.ModMapData[SHADOW_DATA_KEY].get(str(path.get_meta("node_id")))
+	return d != null and d.get("crop_ends", false)
+
+# Crop Ends : quads BLEUS (crop absolu, prioritaire sur la protection verte) au-delà du
+# DERNIER PIXEL de l'endcap, perpendiculaires au mur, à chaque VRAIE extrémité (les
+# coupes de portails sont exclues en consommant les 2 extrémités les plus proches de
+# chaque portail). Sans endcap, le crop se fait à l'extrémité du mur. Indépendant du
+# crop latéral, actif aussi en Both.
+func _populate_wall_end_crop(container, path, segments, seg_xf, line_inv, reach):
+	if is_path_closed(path) and segments.size() == 1:
+		return
+	var tex_width = segments[0].width if segments.size() > 0 else 20.0
+	# Extrémités ouvertes (pos + tangente SORTANTE, line-local).
+	var ends = []
+	for si in range(segments.size()):
+		var p = segments[si].points
+		if p.size() < 2:
+			continue
+		var ta = p[1] - p[0]
+		var tb = p[p.size() - 1] - p[p.size() - 2]
+		if ta.length() > 0.001:
+			ends.append({"p": seg_xf[si].xform(p[0]), "t": seg_xf[si].basis_xform(-ta.normalized()).normalized(), "used": false})
+		if tb.length() > 0.001:
+			ends.append({"p": seg_xf[si].xform(p[p.size() - 1]), "t": seg_xf[si].basis_xform(tb.normalized()).normalized(), "used": false})
+	# Les coupes de PORTAILS ne sont pas des extrémités : chaque portail consomme ses
+	# deux extrémités les plus proches.
+	for pci in range(path.get_child_count()):
+		var pc = path.get_child(pci)
+		if not (str(pc.name).begins_with("Portal") or str(pc.name).begins_with("@Portal")):
+			continue
+		if not (pc is Node2D):
+			continue
+		var ppos = (line_inv * pc.get_global_transform()).origin
+		for _k in range(2):
+			var best = -1
+			var bestd = 1.0e20
+			for ei in range(ends.size()):
+				if ends[ei]["used"]:
+					continue
+				var dd = ppos.distance_squared_to(ends[ei]["p"])
+				if dd < bestd:
+					bestd = dd
+					best = ei
+			if best >= 0:
+				ends[best]["used"] = true
+	for e in ends:
+		if e["used"]:
+			continue
+		var end_p = e["p"]
+		var t = e["t"]
+		# Bord extérieur de l'endcap : projection max des coins du rect des Sprites
+		# proches de l'extrémité sur la tangente sortante. 0 si pas d'endcap.
+		var d_end = 0.0
+		for si2 in range(segments.size()):
+			for che in segments[si2].get_children():
+				if not (che is Sprite) or che.texture == null:
+					continue
+				var sxf = seg_xf[si2] * che.transform
+				if sxf.origin.distance_to(end_p) > tex_width * 4.0 + 64.0:
+					continue
+				var r = che.get_rect()
+				for cx in [r.position.x, r.position.x + r.size.x]:
+					for cy in [r.position.y, r.position.y + r.size.y]:
+						var proj = (sxf.xform(Vector2(cx, cy)) - end_p).dot(t)
+						if proj > d_end:
+							d_end = proj
+		var c = end_p + t * d_end
+		var nrm = Vector2(-t.y, t.x)
+		var mi = MeshInstance2D.new()
+		mi.mesh = _end_crop_gradient_mesh(c, t, nrm, tex_width * 0.5 + 4.0, reach, reach + 8.0)
+		mi.material = _crop_tint_mat_ends()
+		container.add_child(mi)
+
+# Gain d'alpha du flou : compense la silhouette DEMI-largeur du mode Side SANS crop
+# (deux fois moins de matière à portée du noyau -> alpha ~/2 à flou fort). Le clamp à 1
+# dans le shader le rend sans effet à flou faible (alpha déjà saturé près du mur).
+func _crop_alpha_gain(radial) -> float:
+	if radial == null:
+		return 1.0
+	if int(radial.get("dir", ShadowDirection.BOTH)) == ShadowDirection.BOTH:
+		return 1.0
+	if radial.get("crop", false):
+		return 1.0   # crop actif : silhouette complète, pas de compensation
+	# 2.0 = compensation théorique exacte à flou fort, mais le clamp élargit le halo
+	# perçu -> trop vif. 1.5 = entre-deux validé visuellement.
+	return 1.5
+
+func _wall_crop_active(config) -> bool:
+	return config.get("crop_blur", false) and int(config.get("direction", ShadowDirection.BOTH)) != ShadowDirection.BOTH
+
+func _wall_crop_reach(blur_px, tex_width) -> float:
+	# Couvre tout débordement possible : rayon de flou + demi-largeur gardée (+ marge).
+	return blur_px + tex_width + 8.0
+
+# Masque du côté interdit, en TRIANGLES : un QUAD par ARÊTE (normale d'arête, borné par
+# le mur -> ne mord jamais le côté gardé, quel que soit l'angle) + un ÉVENTAIL d'arc aux
+# coins CONVEXES côté interdit (comble le secteur entre deux quads sans dépasser leurs
+# normales d'arête -> pas de triangle d'ombre résiduel, pas de morsure). Remplace le strip
+# à normales miter : le clamp du miter (2.0) laissait un coin de masque ouvert aux angles
+# aigus (triangles d'ombre côté interdit), et le bevel mordait le côté gardé.
+# Les extrémités OUVERTES sont prolongées longitudinalement de `reach` (arête colinéaire
+# supplémentaire) : couvre le flou des ENDCAPS et le débordement des ouvertures.
+func _build_wall_crop_mesh(seg, dir, closed, reach) -> ArrayMesh:
+	var mesh = ArrayMesh.new()
+	var src = seg.points
+	if not closed and src.size() >= 2:
+		var t0 = src[1] - src[0]
+		var t1 = src[src.size() - 1] - src[src.size() - 2]
+		if t0.length() > 0.001 and t1.length() > 0.001:
+			var ext = PoolVector2Array()
+			ext.append(src[0] - t0.normalized() * reach)
+			ext.append_array(src)
+			ext.append(src[src.size() - 1] + t1.normalized() * reach)
+			src = ext
+	var pts = src
+	var n = pts.size()
+	if n < 2:
+		return mesh
+	var side = -1.0 if dir == ShadowDirection.OUTER else 1.0
+	var verts = PoolVector2Array()
+	var edge_count = n if closed else n - 1
+	var edge_n = []
+	for i in range(edge_count):
+		var a = pts[i]
+		var b = pts[(i + 1) % n]
+		var d = b - a
+		if d.length() < 0.001:
+			edge_n.append(Vector2.ZERO)
+			continue
+		d = d.normalized()
+		edge_n.append(Vector2(-d.y, d.x) * side)
+	# Coins CONCAVES côté interdit : point MITER (intersection des deux lignes d'offset,
+	# sur la bissectrice) -> chaque quad est rabattu à la bissectrice et ne peut JAMAIS
+	# traverser l'autre branche (fini les morsures aux angles aigus), et les deux quads
+	# se rejoignent sans trou. Non clampé (le miter reste DANS le coin, entre les deux
+	# arêtes) ; denom borné pour les demi-tours quasi parfaits.
+	var c_start = 0 if closed else 1
+	var c_end = edge_count if closed else n - 1
+	var miter_at = {}
+	for ci in range(c_start, c_end):
+		var e_prev = (ci - 1 + edge_count) % edge_count
+		var vA = edge_n[e_prev]
+		var vB = edge_n[ci % edge_count]
+		if vA.length() < 0.5 or vB.length() < 0.5:
+			continue
+		if vA.cross(vB) * side < 0.0001:
+			continue   # convexe (éventail) ou colinéaire (quads carrés jointifs)
+		var mraw = vA + vB
+		if mraw.length() < 0.001:
+			continue   # demi-tour parfait : dégénéré, quads carrés
+		var mn = mraw.normalized()
+		var denom = max(mn.dot(vA), 0.05)
+		# Borne le miter à la plus courte des deux arêtes : au-delà, il ressortirait du
+		# coin SUIVANT (nouvelle morsure). Contrepartie : au fond d'un coin très aigu et
+		# profond, le masque n'atteint pas tout à fait le reach latéral (fuite d'ombre
+		# infime dans la crevasse entre les deux branches).
+		var vtx = pts[ci % n]
+		var lcap = max(reach, min((vtx - pts[(ci - 1 + n) % n]).length(), (pts[(ci + 1) % n] - vtx).length()))
+		miter_at[ci % n] = vtx + mn * min(reach / denom, lcap)
+	# QUADS par arête, extrémités rabattues au miter aux coins concaves.
+	for i in range(edge_count):
+		var nrm = edge_n[i]
+		if nrm.length() < 0.5:
+			continue
+		var a = pts[i]
+		var b = pts[(i + 1) % n]
+		var a2 = miter_at.get(i, a + nrm * reach)
+		var b2 = miter_at.get((i + 1) % n, b + nrm * reach)
+		verts.append(a)
+		verts.append(a2)
+		verts.append(b)
+		verts.append(b)
+		verts.append(a2)
+		verts.append(b2)
+	# Éventails aux coins : uniquement quand le côté interdit est CONVEXE au virage
+	# (cross(vA, vB) * side < 0). Côté concave, le miter ci-dessus fait la jointure.
+	for ci in range(c_start, c_end):
+		var e_prev = (ci - 1 + edge_count) % edge_count
+		var vA = edge_n[e_prev]
+		var vB = edge_n[ci % edge_count]
+		if vA.length() < 0.5 or vB.length() < 0.5:
+			continue
+		var crossz = vA.cross(vB)
+		if crossz * side >= -0.0001:
+			continue
+		var ang = atan2(crossz, vA.dot(vB))
+		var steps = int(max(1, ceil(abs(ang) / 0.4)))
+		var corner = pts[ci % n]
+		var u_prev = vA
+		for k in range(1, steps + 1):
+			var u_k = vA.rotated(ang * float(k) / float(steps))
+			verts.append(corner)
+			verts.append(corner + u_prev * reach)
+			verts.append(corner + u_k * reach)
+			u_prev = u_k
+	if verts.size() < 3:
+		return mesh
+	var arrays = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	return mesh
+
+# Deux passes : côté INTERDIT (rouge) + côté GARDÉ (vert, même géométrie côté opposé).
+# Le vert PROTÈGE : une branche non adjacente (hairpin, courbe dense) dont le quad
+# interdit traverse le path/mur ne coupe plus l'ombre gardée qui vit là (R sans G).
+func _populate_wall_crop_mask(container, path, segments, seg_xf, line_inv, dir, reach):
+	_populate_wall_crop_side(container, path, segments, seg_xf, line_inv, dir, reach, false)
+	_populate_wall_crop_side(container, path, segments, seg_xf, line_inv, _crop_opposite_dir(dir), reach, true)
+
+func _populate_wall_crop_side(container, path, segments, seg_xf, line_inv, dir, reach, is_keep):
+	var closed = is_path_closed(path) and segments.size() == 1
+	var side = -1.0 if dir == ShadowDirection.OUTER else 1.0
+	for si in range(segments.size()):
+		var strip = _build_wall_crop_mesh(segments[si], dir, closed, reach)
+		if strip.get_surface_count() == 0:
+			continue
+		var mi = MeshInstance2D.new()
+		mi.mesh = strip
+		mi.transform = seg_xf[si]
+		mi.material = _crop_tint_mat(is_keep)
+		container.add_child(mi)
+	if closed:
+		return
+	# Ponts aux PORTAILS : les segments Line2D sont coupés autour des portails -> la bande
+	# per-segment laisse un trou dans le masque, et la silhouette du portail (porte/fenêtre)
+	# y déborde en flou. Pour chaque portail avec sprite, on ponte les deux extrémités de
+	# segment les plus proches par un quad centre->côté interdit (en espace LINE-local).
+	# Extrémités ouvertes : position + normale (+90° du tangent, même convention que
+	# calculate_point_normals) en line-local.
+	var ends = []
+	for si2 in range(segments.size()):
+		var p = segments[si2].points
+		if p.size() < 2:
+			continue
+		var ta = (p[1] - p[0])
+		var tb = (p[p.size() - 1] - p[p.size() - 2])
+		if ta.length() > 0.001:
+			var na = Vector2(-ta.y, ta.x).normalized()
+			ends.append({"p": seg_xf[si2].xform(p[0]), "n": seg_xf[si2].basis_xform(na).normalized()})
+		if tb.length() > 0.001:
+			var nb = Vector2(-tb.y, tb.x).normalized()
+			ends.append({"p": seg_xf[si2].xform(p[p.size() - 1]), "n": seg_xf[si2].basis_xform(nb).normalized()})
+	if ends.size() < 2:
+		return
+	for pci in range(path.get_child_count()):
+		var pc = path.get_child(pci)
+		if not (str(pc.name).begins_with("Portal") or str(pc.name).begins_with("@Portal")):
+			continue
+		if pc.get_child_count() == 0:
+			continue
+		var psp = pc.get_child(0)
+		if not (psp is Sprite) or psp.texture == null:
+			continue
+		var ppos = (line_inv * psp.global_transform).origin
+		# Deux extrémités les plus proches du portail.
+		var i0 = -1
+		var i1 = -1
+		var d0 = 1.0e20
+		var d1 = 1.0e20
+		for ei in range(ends.size()):
+			var dd = ppos.distance_squared_to(ends[ei]["p"])
+			if dd < d0:
+				d1 = d0
+				i1 = i0
+				d0 = dd
+				i0 = ei
+			elif dd < d1:
+				d1 = dd
+				i1 = ei
+		if i0 < 0 or i1 < 0:
+			continue
+		var e0 = ends[i0]["p"]
+		var e1 = ends[i1]["p"]
+		var db = e1 - e0
+		if db.length() < 0.001:
+			continue
+		db = db.normalized()
+		# Léger chevauchement longitudinal avec les bandes adjacentes (pas de couture).
+		var v0 = e0 - db * 4.0
+		var v1 = e1 + db * 4.0
+		var n_b = Vector2(-db.y, db.x)
+		# Oriente la normale du pont comme celle de l'extrémité adjacente (indépendant de
+		# l'ordre des points des segments).
+		if n_b.dot(ends[i0]["n"]) < 0.0:
+			n_b = -n_b
+		var verts = PoolVector2Array()
+		verts.append(v0)
+		verts.append(v0 + n_b * side * reach)
+		verts.append(v1)
+		verts.append(v1 + n_b * side * reach)
+		var arrays = []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = verts
+		var bmesh = ArrayMesh.new()
+		bmesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLE_STRIP, arrays)
+		var bmi = MeshInstance2D.new()
+		bmi.mesh = bmesh   # espace line-local -> transform identité (le container mappe line-local)
+		bmi.material = _crop_tint_mat(is_keep)
+		container.add_child(bmi)
+
+# Viewport de capture du masque, aligné (taille/transform) sur la capture principale.
+# Enfant du viewport principal -> libéré automatiquement avec lui (tous les teardowns).
+func _make_wall_crop_viewport(vp, container, path, segments, seg_xf, line_inv, dir, reach, v_flip, update_mode, side_on = true, ends_on = false):
+	var mvp = Viewport.new()
+	mvp.size = vp.size
+	mvp.transparent_bg = true
+	mvp.usage = Viewport.USAGE_2D
+	mvp.disable_3d = true
+	mvp.hdr = false
+	mvp.render_target_v_flip = v_flip
+	mvp.render_target_update_mode = update_mode
+	var mcont = Node2D.new()
+	mcont.scale = container.scale
+	mcont.position = container.position
+	mvp.add_child(mcont)
+	if side_on:
+		_populate_wall_crop_mask(mcont, path, segments, seg_xf, line_inv, dir, reach)
+	if ends_on:
+		_populate_wall_end_crop(mcont, path, segments, seg_xf, line_inv, reach)
+	vp.add_child(mvp)   # un Viewport n'est pas un CanvasItem -> ne pollue pas la capture principale
+	return [mvp, mcont]
+
+func _apply_wall_crop_params(mat, mask_tex):
+	if mask_tex == null:
+		mat.set_shader_param("crop_enabled", 0.0)
+		return
+	mat.set_shader_param("crop_enabled", 1.0)
+	mat.set_shader_param("crop_mask", mask_tex)
+
+# Purge EXHAUSTIVE : libère tout sprite realistic appartenant à ce mur (tag _wall_r_owner)
+# où qu'il soit dans l'arbre (line courante, ancienne line, conteneur below-all), sauf `keep`.
+func _purge_wall_r_sprites(path, line, nid, keep):
+	var roots = []
+	if is_instance_valid(path):
+		roots.append(path.get_parent())   # nœud Walls -> couvre toutes les lines (own-wall)
+	var ba = _get_below_all_container(line) if is_instance_valid(line) else null
+	if ba != null:
+		roots.append(ba)
+	var found = []
+	for r in roots:
+		if r != null and is_instance_valid(r):
+			_purge_wall_r_recursive(r, nid, keep, found)
+	# Libère APRÈS la collecte (ne jamais modifier l'arbre pendant l'itération).
+	for s in found:
+		if is_instance_valid(s):
+			if s.get_parent() != null:
+				s.get_parent().remove_child(s)
+			s.free()
+
+func _purge_wall_r_recursive(node, nid, keep, found):
+	for c in node.get_children():
+		if c != keep and (c is Sprite) and c.has_meta("_wall_r_owner") and int(c.get_meta("_wall_r_owner")) == nid:
+			found.append(c)
+		elif c.get_child_count() > 0:
+			_purge_wall_r_recursive(c, nid, keep, found)
+
+
+# Applique couleur/opacité/flou sur le matériau du sprite realistic (shader de flou).
+func _apply_wall_r_params(mat, vp_size, blur_px, scale_f, shadow_color, opacity):
+	_apply_realistic_blur_params(mat, vp_size, blur_px, scale_f, shadow_color, opacity)
+
+# Place le sprite : centré sur base_pos+offset (line-local), échelle 1/scale_f, mappé dans
+# le repère du parent (mur, ou conteneur below-all).
+# Wrapper Node2D (enfant du Line2D, derrière lui) qui contient le sprite d'ombre. Comme
+# "Colour and Modify Things" itère line.get_children() et n'écrase le matériau que des
+# Sprite, notre ombre logée dans ce Node2D est protégée.
+func _get_wall_r_wrapper(line):
+	for c in line.get_children():
+		if (c is Node2D) and not (c is Sprite) and str(c.name) == "DropShadowRealisticWrap":
+			return c
+	var w = Node2D.new()
+	w.name = "DropShadowRealisticWrap"
+	w.show_behind_parent = true
+	line.add_child(w)
+	return w
+
+func _place_wall_r_sprite(spr, shadow_parent, line, line_global_xform, base_pos, offset, scale_f):
+	var local_place = Transform2D()
+	local_place.x = Vector2(1.0 / scale_f, 0.0)
+	local_place.y = Vector2(0.0, 1.0 / scale_f)
+	local_place.origin = base_pos + offset
+	if shadow_parent == line:
+		spr.transform = local_place
+		spr.show_behind_parent = true
+	else:
+		spr.transform = shadow_parent.global_transform.affine_inverse() * line_global_xform * local_place
+		spr.show_behind_parent = false
+	spr.z_index = 0
+
+
+# Vrai si le seul réglage modifié est un paramètre "live" (n'affecte pas la silhouette).
+func _can_live_update_realistic_wall(cfg) -> bool:
+	if cfg.get("render_mode", "simple") != "realistic":
+		return false
+	return _wall_last_changed in WALL_R_LIVE_PARAMS
+
+# MAJ en place du sprite realistic (réglages) sans recapture ni flicker. False -> recapture.
+func _live_update_realistic_wall(node, cfg) -> bool:
+	var nid = node.get_instance_id()
+	var line = get_line2d(node)
+	if line == null or not is_instance_valid(line):
+		return false
+	var shadow_color = cfg.get("shadow_color", Color(0, 0, 0, 1))
+	if shadow_color is String:
+		shadow_color = Color(shadow_color)
+	var opacity = cfg.get("opacity_realistic", cfg.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"]))
+	var blur_px = _realistic_blur_px_from_frac(cfg.get("realistic_blur", DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2)))
+	var radial = _make_radial(cfg)
+	var offset = Vector2(cfg.get("offset_x", 0.0), cfg.get("offset_y", 0.0))
+	if line.rotation != 0.0:
+		offset = offset.rotated(-line.rotation)
+
+	# Session live active -> mise à jour en direct (radial inclus).
+	if _wall_r_session.has(nid):
+		return _update_wall_r_session(nid, node, line, radial, offset, shadow_color, opacity, blur_px)
+
+	# Changement de silhouette (radial/side, même vers 0) -> session live (reconstruit la
+	# silhouette ; sinon un retour à 0 laisserait le sprite statique déformé).
+	if _wall_last_changed in ["radial_offset", "side_balance", "direction"] and node.has_meta(SHADOW_META_KEY):
+		var below_all = cfg.get("below_all_walls", false)
+		var shadow_parent = _get_wall_r_wrapper(line)
+		var line_global_xform = line.global_transform
+		var wall_nid = str(node.get_meta("node_id")) if node.has_meta("node_id") else ""
+		if below_all:
+			var ba = _get_below_all_container(line)
+			if ba != null:
+				shadow_parent = ba
+		_start_wall_r_session(node, line, shadow_parent, line_global_xform, wall_nid, radial, offset, shadow_color, opacity, blur_px)
+		return true
+
+	# Sinon (offset/blur/couleur sur un sprite statique) -> MAJ en place.
+	if not _wall_r_live.has(nid):
+		return false
+	var s = _wall_r_live[nid]
+	var spr = s["sprite"]
+	if not is_instance_valid(spr):
+		_wall_r_live.erase(nid)
+		return false
+	if spr.material is ShaderMaterial:
+		_apply_wall_r_params(spr.material, s["vp_size"], blur_px, s["scale_f"], shadow_color, opacity)
+		spr.material.set_shader_param("alpha_gain", _crop_alpha_gain(radial))
+	_place_wall_r_sprite(spr, s["parent"], line, s["line_xform"], s["base_pos"], offset, s["scale_f"])
+	return true
+
+# Recapture différée (debounce) des changements de silhouette realistic (radial/side/géométrie).
+# Pendant l'édition, l'ancien sprite reste affiché ; au repos (WALL_R_SETTLE_MS), on recapture
+# une seule fois (swap atomique -> pas de flicker, pas de readback par frame -> pas de lag).
+# Au repos (souris relâchée, calme), reconvertit une session live en texture statique
+# mipmappée (qualité pleine) via un bake statique qui réutilise le sprite et libère le
+# viewport persistant. Pendant le drag (bouton tenu), on garde le live.
+func _process_wall_r_session_settle():
+	if _wall_r_session.empty():
+		return
+	if Input.is_mouse_button_pressed(BUTTON_LEFT):
+		return
+	var now = OS.get_ticks_msec()
+	var ready = []
+	for nid in _wall_r_session:
+		if now - _wall_r_last_req.get(nid, 0) >= WALL_R_LIVE_SETTLE_MS:
+			ready.append(nid)
+	for nid in ready:
+		if _wall_r_capturing.has(nid):
+			continue
+		var node = instance_from_id(nid)
+		var s = _wall_r_session[nid]
+		if node == null or not is_instance_valid(node):
+			_wall_r_session.erase(nid)
+			_wall_r_last_req.erase(nid)
+			if is_instance_valid(s["vp"]):
+				s["vp"].queue_free()
+			continue
+		var node_id = str(node.get_meta("node_id")) if node.has_meta("node_id") else ""
+		var cfg = null
+		if node_id != "" and global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(node_id):
+			cfg = global.ModMapData[SHADOW_DATA_KEY][node_id].duplicate()
+			if cfg.has("shadow_color") and cfg["shadow_color"] is String:
+				cfg["shadow_color"] = Color(cfg["shadow_color"])
+		if cfg != null and cfg.get("enabled", false) and cfg.get("render_mode", "simple") == "realistic":
+			create_shadow(node, cfg)   # bake statique -> réutilise le sprite + libère la session
+		else:
+			_wall_r_session.erase(nid)
+			_wall_r_last_req.erase(nid)
+			if is_instance_valid(s["vp"]):
+				s["vp"].queue_free()
+
+func _process_wall_r_settle():
+	if _wall_r_settle.empty():
+		return
+	# Tant que le bouton gauche est tenu (drag d'un slider), on ne recapture PAS :
+	# l'ancien sprite reste affiché, la capture se fait une seule fois au relâchement.
+	if Input.is_mouse_button_pressed(BUTTON_LEFT):
+		return
+	var now = OS.get_ticks_msec()
+	var ready = []
+	for nid in _wall_r_settle:
+		if _wall_r_capturing.has(nid):
+			continue  # capture déjà en vol pour ce mur
+		if now - _wall_r_settle_time.get(nid, 0) >= WALL_R_SETTLE_MS:
+			ready.append(nid)
+	for nid in ready:
+		var cfg = _wall_r_settle[nid]
+		_wall_r_settle.erase(nid)
+		_wall_r_settle_time.erase(nid)
+		var node = instance_from_id(nid)
+		if node != null and is_instance_valid(node) and cfg.get("enabled", false):
+			create_shadow(node, cfg)
+
+
 func create_shadow(path, config: Dictionary):
 	if path == null or not is_instance_valid(path):
 		return
 
 	var line = get_line2d(path)
 	if line == null:
+		return
+
+	# Mode "Realistic" : silhouette texturée du mur, décalée + floutée, rendue dessous.
+	if config.get("render_mode", "simple") == "realistic":
+		create_realistic_shadow_wall(path, config, line)
 		return
 
 
@@ -4996,7 +7176,7 @@ func create_shadow(path, config: Dictionary):
 
 	# Determine shadow parent: either the line (default) or a level-wide container
 	var below_all = config.get("below_all_walls", false)
-	var shadow_parent = line
+	var shadow_parent = _get_wall_r_wrapper(line)
 	var line_global_xform = line.global_transform
 	var wall_nid = str(path.get_meta("node_id")) if path.has_meta("node_id") else ""
 	if below_all:
@@ -5304,6 +7484,20 @@ func create_shadow(path, config: Dictionary):
 func remove_shadow(path):
 	if path == null or not is_instance_valid(path):
 		return
+	# Invalide toute capture realistic asynchrone encore en attente sur ce mur.
+	var _rnid = path.get_instance_id()
+	if _realistic_gen.has(_rnid):
+		_realistic_gen[_rnid] = _realistic_gen[_rnid] + 1
+	_wall_r_live.erase(_rnid)
+	_wall_loop_nat.erase(_rnid)
+	if _wall_r_session.has(_rnid):
+		var _rs = _wall_r_session[_rnid]
+		_wall_r_session.erase(_rnid)
+		_wall_r_last_req.erase(_rnid)
+		if is_instance_valid(_rs["vp"]):
+			_rs["vp"].queue_free()
+	_wall_r_settle.erase(_rnid)
+	_wall_r_settle_time.erase(_rnid)
 	if path.has_meta(SHADOW_META_KEY):
 		var nodes = path.get_meta(SHADOW_META_KEY)
 		if nodes is Array:
@@ -5394,6 +7588,9 @@ func _update_transition_visibility(node_type: String):
 	if closed and _monitored_path != null and is_instance_valid(_monitored_path):
 		loop_has_skips = _wall_has_skipped_portals(_monitored_path)
 	var hide_extend = closed and not loop_has_skips
+	# En mode Realistic, "extend with fade" ne s'applique pas -> masqué.
+	if ui_config.has("mode_btn_1") and ui_config["mode_btn_1"].pressed:
+		hide_extend = true
 	if hide_extend:
 		if ui_config.has("ext_hbox"):
 			ui_config["ext_hbox"].visible = false
@@ -5492,8 +7689,20 @@ func set_ui_without_signals(config: Dictionary):
 		ui_config[c].set_block_signals(true)
 
 	ui_config["enable_check"].pressed = config.get("enabled", false)
-	ui_config["opacity_slider"].value = config.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"])
-	ui_config["opacity_spin"].value = config.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"])
+	var _rm_real = config.get("render_mode", "simple") == "realistic"
+	var _op_s = config.get("opacity", DEFAULT_SHADOW_CONFIG["opacity"])
+	var _op_r = config.get("opacity_realistic", _op_s)
+	ui_config["opacity_inactive"] = _op_s if _rm_real else _op_r
+	var _op_mx = 2.0 if _rm_real else 1.0
+	ui_config["opacity_slider"].max_value = _op_mx
+	ui_config["opacity_spin"].max_value = _op_mx
+	ui_config["opacity_slider"].value = _op_r if _rm_real else _op_s
+	ui_config["opacity_spin"].value = _op_r if _rm_real else _op_s
+	if ui_config.has("crop_blur_check"):
+		ui_config["crop_blur_check"].pressed = config.get("crop_blur", false)
+	if ui_config.has("crop_ends_check"):
+		ui_config["crop_ends_check"].pressed = config.get("crop_ends", false)
+	_update_crop_blur_visibility()
 	ui_config["softness_slider"].value = config.get("softness", DEFAULT_SHADOW_CONFIG["softness"])
 	ui_config["softness_spin"].value = config.get("softness", DEFAULT_SHADOW_CONFIG["softness"])
 	ui_config["spread_slider"].value = config.get("spread", DEFAULT_SHADOW_CONFIG["spread"])
@@ -5555,6 +7764,10 @@ func set_ui_without_signals(config: Dictionary):
 	ui_config["swap_ends_check"].pressed = config.get("swap_ends", DEFAULT_SHADOW_CONFIG["swap_ends"])
 	ui_config["skip_portals_check"].pressed = config.get("skip_portals", DEFAULT_SHADOW_CONFIG["skip_portals"])
 	ui_config["below_all_walls_check"].pressed = config.get("below_all_walls", DEFAULT_SHADOW_CONFIG["below_all_walls"])
+	if ui_config.has("realistic_blur_slider"):
+		ui_config["realistic_blur_slider"].value = config.get("realistic_blur", DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2))
+	if ui_config.has("mode_btn_0"):
+		_set_render_mode_buttons(_render_mode_to_index(config.get("render_mode", "simple")))
 	var sc = config.get("shadow_color", DEFAULT_SHADOW_CONFIG["shadow_color"])
 	if sc is String:
 		sc = Color(sc)
@@ -5563,6 +7776,8 @@ func set_ui_without_signals(config: Dictionary):
 	# Update transition controls visibility (spin, reset, slider)
 	_update_transition_controls_visibility()
 	ui_config["dir_wrapper"].visible = ui_config["enable_check"].pressed
+	if ui_config.has("mode_wrapper"):
+		ui_config["mode_wrapper"].visible = ui_config["enable_check"].pressed
 	ui_config["settings_toggle"].visible = ui_config["enable_check"].pressed
 	ui_config["title_reset_btn"].visible = ui_config["enable_check"].pressed
 	if ui_config["enable_check"].pressed:
