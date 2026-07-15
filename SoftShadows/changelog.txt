@@ -1,5 +1,9 @@
 SOFT SHADOWS
 
+v1.5.1
+- Renamed "Reset Defaults" to "Factory Reset" for Objects (was only for paths and walls before, objects were forgotten)
+- Fixed the default opacity sliders (walls and paths) to be 0.6 in simple mode and 1.2 in realistic mode
+
 v1.5.0
 - Fixed global bake mixing levels at reload
 - Added a Realistic option for Paths and Walls shadows (needs more GPU than the simple mode)

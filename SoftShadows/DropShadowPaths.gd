@@ -21,8 +21,8 @@ const USER_DEFAULTS_WALL_KEY = "DropShadowUserDefaultsWall"
 
 const FACTORY_DEFAULTS = {
 	"enabled": false,
-	"opacity": 1.0,
-	"opacity_realistic": 0.9,
+	"opacity": 0.6,
+	"opacity_realistic": 1.2,
 	"softness": 2.75,
 	"direction": 2,
 	"spread": 0.25,
@@ -1178,7 +1178,7 @@ func initialise() -> void:
 	_hook_export_dialog()
 
 	outputlog("Drop Shadow Paths initialised.", 0)
-	outputlog("[BUILD: PATHS-FRAMELOCK-2]", 0)
+	outputlog("[BUILD: PATHS-OPACITY-MODES-1]", 0)
 
 #########################################################################################################
 ##
@@ -1829,7 +1829,17 @@ func _get_path_tool_config(path = null) -> Dictionary:
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
 	cfg["enabled"] = true
-	cfg["opacity"] = pt_ui["opacity_spin"].value
+	# Mode-independent opacity: the slider holds the active mode's value, the other
+	# mode's value is kept in pt_ui["opacity_inactive"] (same pattern as SelectTool).
+	var _pt_realistic = (_get_pt_render_mode() == "realistic")
+	var _pt_op_active = pt_ui["opacity_spin"].value
+	var _pt_op_other = pt_ui.get("opacity_inactive", FACTORY_DEFAULTS["opacity"] if _pt_realistic else FACTORY_DEFAULTS["opacity_realistic"])
+	if _pt_realistic:
+		cfg["opacity_realistic"] = _pt_op_active
+		cfg["opacity"] = _pt_op_other
+	else:
+		cfg["opacity"] = _pt_op_active
+		cfg["opacity_realistic"] = _pt_op_other
 	cfg["spread"] = pt_ui["spread_spin"].value
 	cfg["softness"] = pt_ui["softness_spin"].value
 	cfg["direction"] = _get_pt_direction()
@@ -1866,6 +1876,19 @@ func _get_pt_render_mode() -> String:
 	return "simple"
 
 func _on_pt_render_mode_pressed(mode_index):
+	# Mode-independent opacity: swap the slider with the inactive mode's value.
+	# Max is raised to 2.0 in Realistic (set max first so a value >1 is not clamped).
+	var _prev = int(pt_ui.get("mode_current", 0))
+	if mode_index != _prev and pt_ui.has("opacity_slider"):
+		var _cur = pt_ui["opacity_slider"].value
+		var _oth = pt_ui.get("opacity_inactive", FACTORY_DEFAULTS["opacity_realistic"] if mode_index == 1 else FACTORY_DEFAULTS["opacity"])
+		pt_ui["opacity_inactive"] = _cur
+		var _mx = 2.0 if mode_index == 1 else 1.0
+		pt_ui["opacity_slider"].max_value = _mx
+		pt_ui["opacity_spin"].max_value = _mx
+		pt_ui["opacity_slider"].value = _oth
+		pt_ui["opacity_spin"].value = _oth
+	pt_ui["mode_current"] = mode_index
 	for i in range(2):
 		if not pt_ui.has("mode_btn_" + str(i)):
 			continue
@@ -1883,6 +1906,13 @@ func _on_pt_spin_changed(value, which):
 	pt_ui[which + "_slider"].value = value
 
 func _on_pt_single_reset(which):
+	# Opacity default depends on the active render mode (simple vs realistic).
+	if which == "opacity" and int(pt_ui.get("mode_current", 0)) == 1:
+		which = "opacity_realistic"
+		var def_val_r = _get_effective_default_for_tool(which, USER_DEFAULTS_KEY)
+		pt_ui["opacity_slider"].value = def_val_r
+		pt_ui["opacity_spin"].value = def_val_r
+		return
 	var def_val = _get_effective_default_for_tool(which, USER_DEFAULTS_KEY)
 	pt_ui[which + "_slider"].value = def_val
 	pt_ui[which + "_spin"].value = def_val
@@ -1920,14 +1950,24 @@ func _sync_pt_ui_from_defaults():
 		var user_def = global.ModMapData[USER_DEFAULTS_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
-	pt_ui["opacity_slider"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
-	pt_ui["opacity_spin"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
+	# Mode first: set mode_current before calling the handler so no swap occurs,
+	# then set the max (2.0 in Realistic) before the value to avoid clamping.
+	var _midx = _render_mode_to_index(cfg.get("render_mode", "simple"))
+	pt_ui["mode_current"] = _midx
+	_on_pt_render_mode_pressed(_midx)
+	var _mx = 2.0 if _midx == 1 else 1.0
+	pt_ui["opacity_slider"].max_value = _mx
+	pt_ui["opacity_spin"].max_value = _mx
+	var _op_s = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
+	var _op_r = cfg.get("opacity_realistic", FACTORY_DEFAULTS["opacity_realistic"])
+	pt_ui["opacity_slider"].value = _op_r if _midx == 1 else _op_s
+	pt_ui["opacity_spin"].value = _op_r if _midx == 1 else _op_s
+	pt_ui["opacity_inactive"] = _op_s if _midx == 1 else _op_r
 	pt_ui["spread_slider"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	pt_ui["spread_spin"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	pt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	pt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	_on_pt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
-	_on_pt_render_mode_pressed(_render_mode_to_index(cfg.get("render_mode", "simple")))
 	if pt_ui.has("extend_check"):
 		pt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
 	if pt_ui.has("fade_extend_slider"):

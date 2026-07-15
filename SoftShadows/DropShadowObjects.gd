@@ -174,7 +174,7 @@ var _baker_script = null
 func initialise() -> void:
 	outputlog("Drop Shadow Objects initialising...")
 	printraw("(%d) " % OS.get_ticks_msec())
-	print("[BUILD: DropShadowObjects clip-diag 2026-06-22 #1]")
+	print("[BUILD: OBJECTS-FACTORY-RESET-1]")
 
 	# Load the shader
 	_shadow_shader = ResourceLoader.load(global.Root + "shaders/DropShadowObject.shader", "Shader", true)
@@ -2738,7 +2738,7 @@ func build_select_tool_ui():
 	use_default_btn.connect("pressed", self, "_on_use_as_default")
 	defaults_hbox.add_child(use_default_btn)
 	var reset_defaults_btn = Button.new()
-	reset_defaults_btn.text = "Reset Defaults"
+	reset_defaults_btn.text = "Factory Reset"
 	reset_defaults_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	reset_defaults_btn.visible = false
 	reset_defaults_btn.connect("pressed", self, "_on_reset_defaults")

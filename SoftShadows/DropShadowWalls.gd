@@ -23,7 +23,7 @@ const USER_DEFAULTS_WALL_KEY = "DropShadowUserDefaultsWall"
 const FACTORY_DEFAULTS = {
 	"enabled": false,
 	"opacity": 0.6,
-	"opacity_realistic": 0.6,
+	"opacity_realistic": 1.2,
 	"softness": 2.75,
 	"direction": 2,
 	"spread": 0.25,
@@ -991,7 +991,7 @@ func initialise() -> void:
 		shadow_history.register_resync(self, "_history_force_resync")
 
 	outputlog("Drop Shadow Walls initialised. (ba-cleanup-v3)", 0)
-	outputlog("[BUILD: WALLS-CLONESRC-1]", 0)
+	outputlog("[BUILD: WALLS-OPACITY-MODES-1]", 0)
 
 #########################################################################################################
 ##
@@ -2047,7 +2047,17 @@ func _get_wall_tool_config() -> Dictionary:
 	cfg["enabled"] = true
 	if not wt_ui.has("opacity_spin"):
 		return cfg
-	cfg["opacity"] = wt_ui["opacity_spin"].value
+	# Mode-independent opacity: the slider holds the active mode's value, the other
+	# mode's value is kept in wt_ui["opacity_inactive"] (same pattern as SelectTool).
+	var _wt_realistic = (_get_wt_render_mode() == 1)
+	var _wt_op_active = wt_ui["opacity_spin"].value
+	var _wt_op_other = wt_ui.get("opacity_inactive", FACTORY_DEFAULTS["opacity"] if _wt_realistic else FACTORY_DEFAULTS["opacity_realistic"])
+	if _wt_realistic:
+		cfg["opacity_realistic"] = _wt_op_active
+		cfg["opacity"] = _wt_op_other
+	else:
+		cfg["opacity"] = _wt_op_active
+		cfg["opacity_realistic"] = _wt_op_other
 	cfg["spread"] = wt_ui["spread_spin"].value
 	cfg["softness"] = wt_ui["softness_spin"].value
 	cfg["direction"] = _get_wt_direction()
@@ -2073,6 +2083,19 @@ func _on_wt_direction_pressed(dir_index):
 			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
 
 func _on_wt_render_mode_pressed(mode_index):
+	# Mode-independent opacity: swap the slider with the inactive mode's value.
+	# Max is raised to 2.0 in Realistic (set max first so a value >1 is not clamped).
+	var _prev = int(wt_ui.get("mode_current", 0))
+	if mode_index != _prev and wt_ui.has("opacity_slider"):
+		var _cur = wt_ui["opacity_slider"].value
+		var _oth = wt_ui.get("opacity_inactive", FACTORY_DEFAULTS["opacity_realistic"] if mode_index == 1 else FACTORY_DEFAULTS["opacity"])
+		wt_ui["opacity_inactive"] = _cur
+		var _mx = 2.0 if mode_index == 1 else 1.0
+		wt_ui["opacity_slider"].max_value = _mx
+		wt_ui["opacity_spin"].max_value = _mx
+		wt_ui["opacity_slider"].value = _oth
+		wt_ui["opacity_spin"].value = _oth
+	wt_ui["mode_current"] = mode_index
 	for i in range(2):
 		if not wt_ui.has("mode_btn_" + str(i)):
 			continue
@@ -2096,6 +2119,13 @@ func _on_wt_spin_changed(value, which):
 	wt_ui[which + "_slider"].value = value
 
 func _on_wt_single_reset(which):
+	# Opacity default depends on the active render mode (simple vs realistic).
+	if which == "opacity" and int(wt_ui.get("mode_current", 0)) == 1:
+		which = "opacity_realistic"
+		var def_val_r = _get_effective_default_for_tool(which, USER_DEFAULTS_WALL_KEY)
+		wt_ui["opacity_slider"].value = def_val_r
+		wt_ui["opacity_spin"].value = def_val_r
+		return
 	var def_val = _get_effective_default_for_tool(which, USER_DEFAULTS_WALL_KEY)
 	wt_ui[which + "_slider"].value = def_val
 	wt_ui[which + "_spin"].value = def_val
@@ -2171,14 +2201,24 @@ func _sync_wt_ui_from_defaults():
 		var user_def = global.ModMapData[USER_DEFAULTS_WALL_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
-	wt_ui["opacity_slider"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
-	wt_ui["opacity_spin"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
+	# Mode first: set mode_current before calling the handler so no swap occurs,
+	# then set the max (2.0 in Realistic) before the value to avoid clamping.
+	var _midx = _render_mode_to_index(cfg.get("render_mode", "simple"))
+	wt_ui["mode_current"] = _midx
+	_on_wt_render_mode_pressed(_midx)
+	var _mx = 2.0 if _midx == 1 else 1.0
+	wt_ui["opacity_slider"].max_value = _mx
+	wt_ui["opacity_spin"].max_value = _mx
+	var _op_s = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
+	var _op_r = cfg.get("opacity_realistic", FACTORY_DEFAULTS["opacity_realistic"])
+	wt_ui["opacity_slider"].value = _op_r if _midx == 1 else _op_s
+	wt_ui["opacity_spin"].value = _op_r if _midx == 1 else _op_s
+	wt_ui["opacity_inactive"] = _op_s if _midx == 1 else _op_r
 	wt_ui["spread_slider"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	wt_ui["spread_spin"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	wt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	wt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	_on_wt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
-	_on_wt_render_mode_pressed(_render_mode_to_index(cfg.get("render_mode", "simple")))
 	if wt_ui.has("extend_check"):
 		wt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
 
