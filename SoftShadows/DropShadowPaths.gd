@@ -1178,7 +1178,7 @@ func initialise() -> void:
 	_hook_export_dialog()
 
 	outputlog("Drop Shadow Paths initialised.", 0)
-	outputlog("[BUILD: PATHS-OPACITY-MODES-1]", 0)
+	outputlog("[BUILD: PATHS-OPACITY-MODES-2]", 0)
 
 #########################################################################################################
 ##
@@ -1718,10 +1718,19 @@ func _build_path_tool_ui():
 
 	# Opacity
 	pt_settings.add_child(_make_pt_slider_row("Opacity", "opacity", 0.05, 1.0, 0.05, DEFAULT_SHADOW_CONFIG["opacity"]))
-	# Spread
-	pt_settings.add_child(_make_pt_slider_row("Spread", "spread", 0.0, 3.0, 0.05, DEFAULT_SHADOW_CONFIG["spread"]))
-	# Softness
-	pt_settings.add_child(_make_pt_slider_row("Softness", "softness", 0.1, 10.0, 0.25, DEFAULT_SHADOW_CONFIG["softness"]))
+	# Spread (Simple mode only)
+	var pt_spread_row = _make_pt_slider_row("Spread", "spread", 0.0, 3.0, 0.05, DEFAULT_SHADOW_CONFIG["spread"])
+	pt_ui["spread_hbox"] = pt_spread_row
+	pt_settings.add_child(pt_spread_row)
+	# Softness (Simple mode only)
+	var pt_soft_row = _make_pt_slider_row("Softness", "softness", 0.1, 10.0, 0.25, DEFAULT_SHADOW_CONFIG["softness"])
+	pt_ui["softness_hbox"] = pt_soft_row
+	pt_settings.add_child(pt_soft_row)
+	# Blur (Realistic mode only)
+	var pt_blur_row = _make_pt_slider_row("Blur", "realistic_blur", 0.0, 1.0, 0.01, DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2))
+	pt_blur_row.visible = false
+	pt_ui["realistic_blur_hbox"] = pt_blur_row
+	pt_settings.add_child(pt_blur_row)
 
 	# Extend Ends with Fade
 	var pt_ext_sep = HSeparator.new()
@@ -1844,10 +1853,12 @@ func _get_path_tool_config(path = null) -> Dictionary:
 	cfg["softness"] = pt_ui["softness_spin"].value
 	cfg["direction"] = _get_pt_direction()
 	cfg["render_mode"] = _get_pt_render_mode()
-	# Extend toggle from path tool UI
+	if pt_ui.has("realistic_blur_spin"):
+		cfg["realistic_blur"] = pt_ui["realistic_blur_spin"].value
+	# Extend toggle from path tool UI — not available in Realistic mode (hidden there).
 	if pt_ui.has("extend_check"):
-		cfg["extend_enabled"] = pt_ui["extend_check"].pressed
-		if pt_ui["extend_check"].pressed:
+		cfg["extend_enabled"] = pt_ui["extend_check"].pressed and not _pt_realistic
+		if cfg["extend_enabled"]:
 			cfg["fade_extend"] = pt_ui["fade_extend_spin"].value if pt_ui.has("fade_extend_spin") else FACTORY_DEFAULTS["fade_extend"]
 	# Apply path transitions if no user defaults
 	if path != null and is_instance_valid(path) and not global.ModMapData.has(USER_DEFAULTS_KEY):
@@ -1898,6 +1909,23 @@ func _on_pt_render_mode_pressed(mode_index):
 			btn.icon = btn.get_icon("radio_checked", "CheckBox")
 		else:
 			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
+	_update_pt_mode_visibility()
+
+# Realistic mode: show Blur, hide Spread/Softness/Extend (and its Shape slider).
+# Simple mode: the opposite.
+func _update_pt_mode_visibility():
+	var _realistic = (int(pt_ui.get("mode_current", 0)) == 1)
+	if pt_ui.has("spread_hbox"):
+		pt_ui["spread_hbox"].visible = not _realistic
+	if pt_ui.has("softness_hbox"):
+		pt_ui["softness_hbox"].visible = not _realistic
+	if pt_ui.has("realistic_blur_hbox"):
+		pt_ui["realistic_blur_hbox"].visible = _realistic
+	if pt_ui.has("pt_ext_hbox"):
+		pt_ui["pt_ext_hbox"].visible = not _realistic
+	if pt_ui.has("fade_extend_container"):
+		var _ext_on = pt_ui.has("extend_check") and pt_ui["extend_check"].pressed
+		pt_ui["fade_extend_container"].visible = (not _realistic) and _ext_on
 
 func _on_pt_slider_changed(value, which):
 	pt_ui[which + "_spin"].value = value
@@ -1967,6 +1995,9 @@ func _sync_pt_ui_from_defaults():
 	pt_ui["spread_spin"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	pt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	pt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
+	if pt_ui.has("realistic_blur_slider"):
+		pt_ui["realistic_blur_slider"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
+		pt_ui["realistic_blur_spin"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
 	_on_pt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
 	if pt_ui.has("extend_check"):
 		pt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
@@ -1984,7 +2015,8 @@ func _on_pt_cog_toggled(pressed):
 
 func _on_pt_extend_toggled(pressed):
 	if pt_ui.has("fade_extend_container"):
-		pt_ui["fade_extend_container"].visible = pressed
+		var _realistic = (int(pt_ui.get("mode_current", 0)) == 1)
+		pt_ui["fade_extend_container"].visible = pressed and not _realistic
 
 func _reparent_pt_extend_toggle(cog_open: bool):
 	var ext_hbox = pt_ui.get("pt_ext_hbox")

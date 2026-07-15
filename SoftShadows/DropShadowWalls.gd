@@ -991,7 +991,7 @@ func initialise() -> void:
 		shadow_history.register_resync(self, "_history_force_resync")
 
 	outputlog("Drop Shadow Walls initialised. (ba-cleanup-v3)", 0)
-	outputlog("[BUILD: WALLS-OPACITY-MODES-1]", 0)
+	outputlog("[BUILD: WALLS-OPACITY-MODES-2]", 0)
 
 #########################################################################################################
 ##
@@ -1967,10 +1967,19 @@ func _build_wall_tool_ui():
 
 	# Opacity
 	wt_settings.add_child(_make_wt_slider_row("Opacity", "opacity", 0.05, 1.0, 0.05, DEFAULT_SHADOW_CONFIG["opacity"]))
-	# Spread
-	wt_settings.add_child(_make_wt_slider_row("Spread", "spread", 0.0, 3.0, 0.05, DEFAULT_SHADOW_CONFIG["spread"]))
-	# Softness
-	wt_settings.add_child(_make_wt_slider_row("Softness", "softness", 0.1, 10.0, 0.25, DEFAULT_SHADOW_CONFIG["softness"]))
+	# Spread (Simple mode only)
+	var wt_spread_row = _make_wt_slider_row("Spread", "spread", 0.0, 3.0, 0.05, DEFAULT_SHADOW_CONFIG["spread"])
+	wt_ui["spread_hbox"] = wt_spread_row
+	wt_settings.add_child(wt_spread_row)
+	# Softness (Simple mode only)
+	var wt_soft_row = _make_wt_slider_row("Softness", "softness", 0.1, 10.0, 0.25, DEFAULT_SHADOW_CONFIG["softness"])
+	wt_ui["softness_hbox"] = wt_soft_row
+	wt_settings.add_child(wt_soft_row)
+	# Blur (Realistic mode only)
+	var wt_blur_row = _make_wt_slider_row("Blur", "realistic_blur", 0.0, 1.0, 0.01, DEFAULT_SHADOW_CONFIG.get("realistic_blur", 0.2))
+	wt_blur_row.visible = false
+	wt_ui["realistic_blur_hbox"] = wt_blur_row
+	wt_settings.add_child(wt_blur_row)
 
 	# Extend Ends with Fade
 	var wt_ext_sep = HSeparator.new()
@@ -2062,9 +2071,12 @@ func _get_wall_tool_config() -> Dictionary:
 	cfg["softness"] = wt_ui["softness_spin"].value
 	cfg["direction"] = _get_wt_direction()
 	cfg["render_mode"] = _render_mode_from_index(_get_wt_render_mode())
+	if wt_ui.has("realistic_blur_spin"):
+		cfg["realistic_blur"] = wt_ui["realistic_blur_spin"].value
 	# Extend (now means: draw rounded caps at ends — no longer forces fade_in/out)
+	# Not available in Realistic mode (the toggle is hidden there).
 	if wt_ui.has("extend_check"):
-		cfg["extend_enabled"] = wt_ui["extend_check"].pressed
+		cfg["extend_enabled"] = wt_ui["extend_check"].pressed and not _wt_realistic
 	return cfg
 
 func _get_wt_direction() -> int:
@@ -2105,6 +2117,19 @@ func _on_wt_render_mode_pressed(mode_index):
 			b.icon = b.get_icon("radio_checked", "CheckBox")
 		else:
 			b.icon = b.get_icon("radio_unchecked", "CheckBox")
+	_update_wt_mode_visibility()
+
+# Realistic mode: show Blur, hide Spread/Softness/Extend. Simple mode: the opposite.
+func _update_wt_mode_visibility():
+	var _realistic = (int(wt_ui.get("mode_current", 0)) == 1)
+	if wt_ui.has("spread_hbox"):
+		wt_ui["spread_hbox"].visible = not _realistic
+	if wt_ui.has("softness_hbox"):
+		wt_ui["softness_hbox"].visible = not _realistic
+	if wt_ui.has("realistic_blur_hbox"):
+		wt_ui["realistic_blur_hbox"].visible = _realistic
+	if wt_ui.has("wt_ext_hbox"):
+		wt_ui["wt_ext_hbox"].visible = not _realistic
 
 func _get_wt_render_mode() -> int:
 	for i in range(2):
@@ -2218,6 +2243,9 @@ func _sync_wt_ui_from_defaults():
 	wt_ui["spread_spin"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
 	wt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
 	wt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
+	if wt_ui.has("realistic_blur_slider"):
+		wt_ui["realistic_blur_slider"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
+		wt_ui["realistic_blur_spin"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
 	_on_wt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
 	if wt_ui.has("extend_check"):
 		wt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
