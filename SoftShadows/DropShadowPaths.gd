@@ -1178,7 +1178,7 @@ func initialise() -> void:
 	_hook_export_dialog()
 
 	outputlog("Drop Shadow Paths initialised.", 0)
-	outputlog("[BUILD: PATHS-OPACITY-MODES-2]", 0)
+	outputlog("[BUILD: PATHS-BTNBORDER-1]", 0)
 
 #########################################################################################################
 ##
@@ -5338,6 +5338,13 @@ func apply_shadow_to_selected_paths():
 					remove_shadow(node)
 					create_shadow(node, cfg)
 				save_shadow_data(node, cfg)
+			# Realistic avec ombre existante : pas de pré-suppression — les builders
+			# font un swap atomique (l'ancienne ombre reste visible pendant le bake
+			# asynchrone) -> pas de flicker sur les params non-live (ex. toggles
+			# bend enabled/link/ramp/smooth).
+			elif cfg["enabled"] and cfg.get("render_mode", "simple") == "realistic" and node.has_meta(SHADOW_META_KEY):
+				create_shadow(node, cfg)
+				save_shadow_data(node, cfg)
 			else:
 				remove_shadow(node)
 				if cfg["enabled"]:
@@ -5368,6 +5375,11 @@ func apply_shadow_to_selected_paths():
 					remove_shadow(node)
 					create_shadow(node, saved)
 				save_shadow_data(node, saved)
+			# Realistic avec ombre existante : swap atomique, pas de pré-suppression
+			# (même logique que la branche monitored ci-dessus).
+			elif saved["enabled"] and saved.get("render_mode", "simple") == "realistic" and node.has_meta(SHADOW_META_KEY):
+				create_shadow(node, saved)
+				save_shadow_data(node, saved)
 			else:
 				remove_shadow(node)
 				if saved["enabled"]:
@@ -5376,9 +5388,13 @@ func apply_shadow_to_selected_paths():
 		else:
 			var saved = global.ModMapData[SHADOW_DATA_KEY][node_id].duplicate()
 			saved["enabled"] = ui_cfg["enabled"]
-			remove_shadow(node)
-			if saved["enabled"]:
+			# Realistic avec ombre existante : swap atomique, pas de pré-suppression.
+			if saved["enabled"] and saved.get("render_mode", "simple") == "realistic" and node.has_meta(SHADOW_META_KEY):
 				create_shadow(node, saved)
+			else:
+				remove_shadow(node)
+				if saved["enabled"]:
+					create_shadow(node, saved)
 			save_shadow_data(node, saved)
 
 	_last_changed_params = []
@@ -7578,8 +7594,12 @@ func _start_realistic_live(path, line, offset, shadow_color, opacity, behind_lay
 	line.add_child(spr)
 	var old_nodes = path.get_meta(SHADOW_META_KEY) if path.has_meta(SHADOW_META_KEY) else null
 	path.set_meta(SHADOW_META_KEY, [spr])
-	_free_shadow_nodes(old_nodes)
-	_realistic_live[nid] = {"vp": vp, "copy": copy, "sprite": spr, "converting": false, "color": shadow_color, "opacity": opacity, "blur_px": blur_px, "offset": offset, "behind": behind_layer, "scale_f": scale_f, "tsize": tsize, "center": center, "bulge": bulge, "radial": radial, "loop": loop_nat != null, "mvp": mvp, "mcont": mcont}
+	# Libération DIFFÉRÉE de l'ancienne ombre : la ViewportTexture de la session a
+	# 1 frame de latence (rien n'est encore rendu) -> libérer tout de suite laisse
+	# une frame vide (flicker au démarrage de chaque session : 1er tick d'un slider
+	# bend, rotate/resize avec bend, etc.). On garde l'ancienne ombre visible et
+	# _process_realistic_live_settle() la libère une fois le viewport dessiné.
+	_realistic_live[nid] = {"vp": vp, "copy": copy, "sprite": spr, "converting": false, "color": shadow_color, "opacity": opacity, "blur_px": blur_px, "offset": offset, "behind": behind_layer, "scale_f": scale_f, "tsize": tsize, "center": center, "bulge": bulge, "radial": radial, "loop": loop_nat != null, "mvp": mvp, "mcont": mcont, "pending_free": old_nodes, "start_frame": Engine.get_frames_drawn()}
 
 func _update_realistic_live(path, line, offset, shadow_color, opacity, behind_layer, blur_px, bulge = null, radial = null):
 	var nid = path.get_instance_id()
@@ -7637,19 +7657,35 @@ func _update_realistic_live(path, line, offset, shadow_color, opacity, behind_la
 	var fits = abs(drift.x) + g["content"].x * 0.5 <= half_frame.x - 1.0
 	fits = fits and abs(drift.y) + g["content"].y * 0.5 <= half_frame.y - 1.0
 	if not fits:
-		# Re-cadrage : centre sur la bbox courante, taille avec marge d'avance, jamais
-		# rétrécie en cours de session. Le viewport ne rendra le NOUVEAU cadrage qu'à la
-		# frame suivante, alors que sprite/copie sont reconfigurés tout de suite -> on
-		# CACHE le sprite pendant cette frame de latence (micro-blink au lieu d'une
-		# frame d'ombre décalée/coupée à chaque refit pendant un tracé rapide).
-		center = g["base_pos"]
-		sess["center"] = center
-		var nts = _live_tsize_for(needed)
-		tsize = Vector2(max(tsize.x, nts.x), max(tsize.y, nts.y))
-		sess["tsize"] = tsize
-		vp.size = tsize
-		sess["sprite"].visible = false
-		sess["refit_frame"] = Engine.get_frames_drawn()
+		# Re-cadrage par REMPLACEMENT de session : l'ancien "resize in place + hide"
+		# cachait le sprite 1 frame (latence ViewportTexture) -> blinks répétés quand
+		# la bbox change en continu (slider bend, rotate/resize avec bend, le vecteur
+		# de bombage étant en espace local). Ici on démarre une NOUVELLE session au
+		# bon cadrage : l'ancien sprite reste affiché (libération différée) jusqu'à la
+		# 1re frame rendue du nouveau viewport -> 1 frame de léger retard géométrique
+		# au lieu d'une frame vide.
+		var old_vp = vp
+		# UNE seule génération retenue : l'attente héritée (génération d'avant, déjà
+		# affichée ≥1 frame) est libérée TOUT DE SUITE. Sans ça, des refits à chaque
+		# frame (tracé avec balayage d'angle) repoussent start_frame en boucle et les
+		# générations s'empilent -> éventail d'ombres fantômes.
+		if sess.has("pending_free"):
+			_free_shadow_nodes(sess["pending_free"])
+		_realistic_live.erase(nid)   # sans free : l'ancien vp/sprite restent vivants
+		_start_realistic_live(path, line, offset, shadow_color, opacity, behind_layer, blur_px, bulge, radial)
+		var ns = _realistic_live.get(nid)
+		if ns != null:
+			var pf = ns["pending_free"] if (ns.has("pending_free") and ns["pending_free"] is Array) else []
+			# L'ancien viewport (le masque mvp en est l'enfant) part avec la
+			# libération différée : le sprite remplacé lit sa texture jusqu'au swap.
+			if is_instance_valid(old_vp):
+				pf.append(old_vp)
+			ns["pending_free"] = pf
+		else:
+			# Redémarrage impossible (géométrie dégénérée) : nettoyage direct.
+			if is_instance_valid(old_vp):
+				old_vp.queue_free()
+		return
 	var copy = sess["copy"]
 	_apply_bake_copy_props(copy, line, scale_f, bulge, radial, loop_nat)
 	copy.position = tsize * 0.5 - center * scale_f
@@ -7707,6 +7743,10 @@ func _teardown_realistic_live(nid):
 	var sess = _realistic_live.get(nid)
 	if sess == null:
 		return
+	# Nœuds en attente de libération différée : les libérer maintenant (ils ne
+	# sont plus référencés par SHADOW_META_KEY -> fuite sinon).
+	if sess.has("pending_free"):
+		_free_shadow_nodes(sess["pending_free"])
 	if is_instance_valid(sess["vp"]):
 		sess["vp"].queue_free()
 	_realistic_live.erase(nid)
@@ -7719,12 +7759,13 @@ func _process_realistic_live_settle():
 	var now = OS.get_ticks_msec()
 	for nid in _realistic_live.keys():
 		var sess = _realistic_live[nid]
-		# Fin de refit : le viewport a re-rendu au nouveau cadrage -> réaffiche le sprite.
-		if sess.has("refit_frame"):
-			if Engine.get_frames_drawn() > sess["refit_frame"]:
-				if is_instance_valid(sess["sprite"]):
-					sess["sprite"].visible = true
-				sess.erase("refit_frame")
+		# Libération différée (voir _start_realistic_live) : l'ancienne ombre est
+		# gardée visible jusqu'à ce que le viewport live ait rendu sa 1re frame.
+		if sess.has("pending_free"):
+			if Engine.get_frames_drawn() > sess.get("start_frame", 0):
+				_free_shadow_nodes(sess["pending_free"])
+				sess.erase("pending_free")
+				sess.erase("start_frame")
 		if sess["converting"]:
 			continue
 		if now - _realistic_last_req.get(nid, 0) < REALISTIC_LIVE_SETTLE_MS:
@@ -8480,8 +8521,27 @@ func _style_apply_dialog(timer: Timer):
 	for child in dialog.get_children():
 		if child is Label and child.text == "":
 			child.visible = false
+		if child is HBoxContainer:
+			# Buttons row of the AcceptDialog: add a 1px white border on each button
+			for btn in child.get_children():
+				if btn is Button:
+					_add_white_border(btn)
 	# Set scope radio icons (needs theme to be inherited first)
 	_update_scope_radio_icons(1)
+
+func _add_white_border(btn: Button):
+	for state in ["normal", "hover", "pressed"]:
+		var sb = btn.get_stylebox(state, "Button")
+		if sb == null:
+			continue
+		var styled = sb.duplicate()
+		if styled is StyleBoxFlat:
+			styled.border_width_left = 1
+			styled.border_width_right = 1
+			styled.border_width_top = 1
+			styled.border_width_bottom = 1
+			styled.border_color = Color(1, 1, 1, 1)
+			btn.add_stylebox_override(state, styled)
 
 func _on_apply_all_confirmed(mode = "all"):
 	ui_config["apply_all_dialog"].hide()

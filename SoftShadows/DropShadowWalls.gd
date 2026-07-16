@@ -991,7 +991,7 @@ func initialise() -> void:
 		shadow_history.register_resync(self, "_history_force_resync")
 
 	outputlog("Drop Shadow Walls initialised. (ba-cleanup-v3)", 0)
-	outputlog("[BUILD: WALLS-OPACITY-MODES-2]", 0)
+	outputlog("[BUILD: WALLS-APPLYALL-NOLAYERS-2]", 0)
 
 #########################################################################################################
 ##
@@ -3374,32 +3374,13 @@ func build_select_tool_ui():
 	apply_dialog.add_cancel("Cancel")
 	apply_dialog.connect("custom_action", self, "_on_apply_all_confirmed")
 
-	# Build inner layout: question label + layer scope radios
+	# Build inner layout: question label (walls have a single layer, no layer scope needed)
 	var dialog_vbox = VBoxContainer.new()
 	dialog_vbox.add_constant_override("separation", 10)
 	var question_label = Label.new()
 	question_label.text = "Which walls do you want to apply this shadow on?"
 	question_label.align = Label.ALIGN_CENTER
 	dialog_vbox.add_child(question_label)
-
-	# Layer scope radio row
-	var scope_hbox = HBoxContainer.new()
-	scope_hbox.add_constant_override("separation", 4)
-	var scope_label = Label.new()
-	scope_label.text = "Layers:"
-	scope_hbox.add_child(scope_label)
-	var scope_names = ["All layers", "Current layer", "Filtered layers"]
-	for i in range(scope_names.size()):
-		var btn = Button.new()
-		btn.text = scope_names[i]
-		btn.toggle_mode = true
-		btn.pressed = (i == 1)  # "Current layer" default
-		btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		btn.align = Button.ALIGN_CENTER
-		btn.connect("pressed", self, "_on_scope_radio_pressed", [i])
-		scope_hbox.add_child(btn)
-		ui_config["scope_btn_" + str(i)] = btn
-	dialog_vbox.add_child(scope_hbox)
 	apply_dialog.add_child(dialog_vbox)
 
 	var windows_container = global.Editor.get_node("Windows")
@@ -3409,13 +3390,13 @@ func build_select_tool_ui():
 		global.Editor.add_child(apply_dialog)
 	ui_config["apply_all_dialog"] = apply_dialog
 
-	# Deferred styling: set scope radio icons + hide empty label
-	var scope_style_timer = Timer.new()
-	scope_style_timer.wait_time = 0.1
-	scope_style_timer.one_shot = true
-	scope_style_timer.connect("timeout", self, "_style_apply_dialog", [scope_style_timer])
-	global.Editor.add_child(scope_style_timer)
-	scope_style_timer.start()
+	# Deferred styling: hide the empty built-in AcceptDialog label
+	var dialog_style_timer = Timer.new()
+	dialog_style_timer.wait_time = 0.1
+	dialog_style_timer.one_shot = true
+	dialog_style_timer.connect("timeout", self, "_style_apply_dialog", [dialog_style_timer])
+	global.Editor.add_child(dialog_style_timer)
+	dialog_style_timer.start()
 
 	container.add_child(settings_panel)
 	ui_config["settings_panel"] = settings_panel
@@ -7911,34 +7892,6 @@ func _update_reset_defaults_visibility():
 func _on_apply_all_pressed():
 	ui_config["apply_all_dialog"].popup_centered()
 
-var _syncing_scope = false
-
-func _on_scope_radio_pressed(index: int):
-	if _syncing_scope:
-		return
-	_update_scope_radio_icons(index)
-
-func _update_scope_radio_icons(active_index: int):
-	_syncing_scope = true
-	for i in range(3):
-		var key = "scope_btn_" + str(i)
-		if not ui_config.has(key):
-			continue
-		var btn = ui_config[key]
-		btn.pressed = (i == active_index)
-		if i == active_index:
-			btn.icon = btn.get_icon("radio_checked", "CheckBox")
-		else:
-			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
-	_syncing_scope = false
-
-func _get_selected_scope() -> int:
-	for i in range(3):
-		var key = "scope_btn_" + str(i)
-		if ui_config.has(key) and ui_config[key].pressed:
-			return i
-	return 1  # default: current layer
-
 func _style_apply_dialog(timer: Timer):
 	timer.queue_free()
 	var dialog = ui_config.get("apply_all_dialog")
@@ -7947,7 +7900,25 @@ func _style_apply_dialog(timer: Timer):
 	for child in dialog.get_children():
 		if child is Label and child.text == "":
 			child.visible = false
-	_update_scope_radio_icons(1)
+		if child is HBoxContainer:
+			# Buttons row of the AcceptDialog: add a 1px white border on each button
+			for btn in child.get_children():
+				if btn is Button:
+					_add_white_border(btn)
+
+func _add_white_border(btn: Button):
+	for state in ["normal", "hover", "pressed"]:
+		var sb = btn.get_stylebox(state, "Button")
+		if sb == null:
+			continue
+		var styled = sb.duplicate()
+		if styled is StyleBoxFlat:
+			styled.border_width_left = 1
+			styled.border_width_right = 1
+			styled.border_width_top = 1
+			styled.border_width_bottom = 1
+			styled.border_color = Color(1, 1, 1, 1)
+			btn.add_stylebox_override(state, styled)
 
 func _on_apply_all_confirmed(mode = "all"):
 	ui_config["apply_all_dialog"].hide()
@@ -7971,88 +7942,39 @@ func _on_apply_all_confirmed(mode = "all"):
 		_history_flush()
 		return
 
-	# Determine layer scope: 0=all, 1=current, 2=filtered
-	var scope = _get_selected_scope()
-	var scope_names = ["all_layers", "current_layer", "filtered_layers"]
-	var scope_name = scope_names[scope]
-
-	var containers = _get_wall_containers_for_scope(scope)
-	if containers.size() == 0:
-		outputlog("apply_all: no wall containers found for scope " + scope_name, 0)
+	# Walls have a single layer: apply to all walls of the current level only
+	var container = _get_current_level_walls_container()
+	if container == null:
+		outputlog("apply_all: no Walls container found on current level", 0)
 		_history_flush()
 		return
 
 	var only_without_shadow = (mode == "no_shadow")
-	var scope_z_filter = ui_config.get("_scope_z_filter", null)
-	var scope_layer_filter = ui_config.get("_scope_layer_filter", null)
-	for container in containers:
-		for obj in container.get_children():
-			if is_shadow_node_type(obj):
-				if scope == 1 and scope_z_filter != null:
-					if obj.z_index != scope_z_filter:
+	for obj in container.get_children():
+		if is_shadow_node_type(obj):
+			if only_without_shadow:
+				if obj.has_meta(SHADOW_META_KEY):
+					var nodes = obj.get_meta(SHADOW_META_KEY)
+					if nodes is Array and nodes.size() > 0:
 						continue
-				if scope == 2 and scope_layer_filter != null:
-					if scope_layer_filter is Dictionary:
-						if scope_layer_filter.has(obj.z_index) and not scope_layer_filter[obj.z_index]:
-							continue
-						if not scope_layer_filter.has(obj.z_index):
-							continue
-				if only_without_shadow:
-					if obj.has_meta(SHADOW_META_KEY):
-						var nodes = obj.get_meta(SHADOW_META_KEY)
-						if nodes is Array and nodes.size() > 0:
-							continue
-				_history_capture_before(obj)
-				var obj_config = cfg.duplicate()
-				remove_shadow(obj)
-				create_shadow(obj, obj_config)
-				save_shadow_data(obj, obj_config)
-				count += 1
-	var z_info = ""
-	if scope_z_filter != null:
-		z_info = " z_filter=" + str(scope_z_filter)
-	outputlog("Applied shadow to " + str(count) + " walls (mode: " + str(mode) + ", scope: " + scope_name + z_info + ")", 0)
-	ui_config.erase("_scope_z_filter")
-	ui_config.erase("_scope_layer_filter")
+			_history_capture_before(obj)
+			var obj_config = cfg.duplicate()
+			remove_shadow(obj)
+			create_shadow(obj, obj_config)
+			save_shadow_data(obj, obj_config)
+			count += 1
+	outputlog("Applied shadow to " + str(count) + " walls (mode: " + str(mode) + ")", 0)
 	_history_flush()
 
-func _get_wall_containers_for_scope(scope: int) -> Array:
-	var containers = []
+func _get_current_level_walls_container():
 	var current_level = global.World.GetCurrentLevel()
 	if current_level == null:
-		return containers
-	var world_root = current_level.get_parent()
-	if world_root != null:
-		for i in range(world_root.get_child_count()):
-			var level = world_root.get_child(i)
-			if not is_instance_valid(level):
-				continue
-			for j in range(level.get_child_count()):
-				var child = level.get_child(j)
-				if child.name == "Walls":
-					containers.append(child)
-					break
-
-	if scope == 0:
-		return containers
-
-	if scope == 1:
-		var target_z = 0
-		if _monitored_path != null and is_instance_valid(_monitored_path):
-			target_z = _monitored_path.z_index
-		ui_config["_scope_z_filter"] = target_z
-		return containers
-
-	if scope == 2:
-		var select_tool = global.Editor.Tools["SelectTool"]
-		var layer_filter = select_tool.get("LayerFilter")
-		if layer_filter != null and layer_filter is Dictionary:
-			ui_config["_scope_layer_filter"] = layer_filter
-		else:
-			ui_config["_scope_layer_filter"] = null
-		return containers
-
-	return containers
+		return null
+	for j in range(current_level.get_child_count()):
+		var child = current_level.get_child(j)
+		if child.name == "Walls":
+			return child
+	return null
 
 func apply_saved_shadows_to_map():
 

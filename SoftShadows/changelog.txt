@@ -4,6 +4,11 @@ v1.5.1
 - Renamed "Reset Defaults" to "Factory Reset" for Objects (was only for paths and walls before, objects were forgotten)
 - Fixed the default opacity sliders (walls and paths) to be 0.6 in simple mode and 1.2 in realistic mode
 - Fixed the realistic settings displayed in the Wall Tool and Path Tool (removed unused sliders and buttons and added the Blur slider)
+- Fixed flickering in realistic mode when drawing paths or editing the bend
+- In a multi-selection, changing an object's overlay setting will not affect all the other settings anymore
+- Fixed undo not working with objects overlays after a delete
+- Removed the layer choice in "Apply To All Walls" as it didn't make sense
+- Added a white outline to the Apply To All choices for Paths and Walls
 
 v1.5.0
 - Fixed global bake mixing levels at reload

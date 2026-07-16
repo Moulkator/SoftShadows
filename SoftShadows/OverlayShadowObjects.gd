@@ -51,6 +51,7 @@ var _pending_signal_nodes = []
 var _ctrl_c_was = false
 var _ctrl_v_was = false
 var _clipboard = {}
+var _heal_counter = 0
 
 const ENABLE_LOGGING = true
 func outputlog(msg, level=0):
@@ -91,7 +92,7 @@ func initialise() -> void:
 	if shadow_history != null and shadow_history.has_method("register_flusher"):
 		shadow_history.register_flusher(self, "_history_flush")
 
-	outputlog("Overlay Shadow Objects initialised.", 0)
+	outputlog("Overlay Shadow Objects initialised. [BUILD: OVERLAY-HEAL-PERKEY-1]", 0)
 
 #########################################################################################################
 ## NODE HELPERS
@@ -293,6 +294,14 @@ func _on_new_node_added(node) -> void:
 	_pending_signal_nodes.append(node)
 
 func _on_monitor_tick() -> void:
+	# Self-heal: roughly once a second, rebuild any saved+enabled overlay whose
+	# live sprite is missing (native delete + undo restores the object node but
+	# not our injected overlay child). No-op in steady state.
+	_heal_counter += 1
+	if _heal_counter >= 100:
+		_heal_counter = 0
+		_heal_missing_shadows()
+
 	var ctrl = Input.is_key_pressed(KEY_CONTROL)
 	var c_pressed = Input.is_key_pressed(KEY_C)
 	var v_pressed = Input.is_key_pressed(KEY_V)
@@ -317,6 +326,38 @@ func _on_monitor_tick() -> void:
 
 	_process_signal_nodes()
 	_process_clone_batch()
+
+func _heal_missing_shadows() -> void:
+	if not global.ModMapData.has(DATA_KEY):
+		return
+	for nid in global.ModMapData[DATA_KEY].keys():
+		var cfg = global.ModMapData[DATA_KEY][nid]
+		if not (cfg is Dictionary) or not cfg.get("enabled", false):
+			continue
+		if int(nid) < 0:
+			continue
+		if not global.World.HasNodeID(int(nid)):
+			continue
+		var node = global.World.GetNodeByID(int(nid))
+		if node == null or not is_instance_valid(node) or not is_obj(node):
+			continue
+		# Skip if a live overlay already exists on this node.
+		if node.has_meta(META_KEY):
+			var alive = false
+			for ov in node.get_meta(META_KEY):
+				if is_instance_valid(ov):
+					alive = true
+					break
+			if alive:
+				continue
+		var sprite = get_sprite(node)
+		if sprite == null or sprite.texture == null:
+			continue  # not ready yet — try again next scan
+		var rcfg = cfg.duplicate()
+		if rcfg.has("shadow_color") and rcfg["shadow_color"] is String:
+			rcfg["shadow_color"] = Color(rcfg["shadow_color"])
+		create_shadow(node, rcfg)
+		_all_known_ids[str(nid)] = node
 
 func _process_signal_nodes() -> void:
 	# Register freshly placed objects so they aren't later mistaken for clones.
@@ -634,7 +675,7 @@ func _on_single_reset(key) -> void:
 		ui[key + "_slider"].value = DEFAULTS[key]
 		ui[key + "_spin"].value = DEFAULTS[key]
 	_syncing = false
-	apply_to_selected()
+	apply_to_selected(false, [key])
 
 func _on_reset() -> void:
 	_syncing = true
@@ -675,7 +716,7 @@ func _on_enable_toggled(pressed) -> void:
 	if _syncing:
 		return
 	ui["panel"].visible = pressed
-	apply_to_selected()
+	apply_to_selected(true)
 
 func _on_slider(value, key) -> void:
 	if _syncing:
@@ -683,7 +724,7 @@ func _on_slider(value, key) -> void:
 	_syncing = true
 	ui[key + "_spin"].value = value
 	_syncing = false
-	apply_to_selected()
+	apply_to_selected(false, [key])
 
 func _on_spin(value, key) -> void:
 	if _syncing:
@@ -691,17 +732,17 @@ func _on_spin(value, key) -> void:
 	_syncing = true
 	ui[key + "_slider"].value = value
 	_syncing = false
-	apply_to_selected()
+	apply_to_selected(false, [key])
 
 func _on_color(_c) -> void:
 	if _syncing:
 		return
-	apply_to_selected()
+	apply_to_selected(false, ["shadow_color"])
 
 func _on_link_toggled(pressed) -> void:
 	_update_link_enabled(pressed)
 	if not _syncing:
-		apply_to_selected()
+		apply_to_selected(false, ["link_sun"])
 
 func _update_link_enabled(linked) -> void:
 	# When linked, the Sun ° controls are driven by the soft shadow -> grey + lock.
@@ -873,17 +914,48 @@ func history_apply(payload) -> void:
 	_history_suspend = false
 
 
-func apply_to_selected() -> void:
-	_history_touch("overlay_obj")
-	var cfg = get_config_from_ui()
+func apply_to_selected(force_all: bool = false, changed_keys: Array = []) -> void:
+	_history_touch("overlay_obj" if changed_keys.empty() else str(changed_keys[0]))
+	var ui_cfg = get_config_from_ui()
 	for node in global.Editor.Tools["SelectTool"].Selected:
 		if not is_obj(node) or not node.has_meta("node_id"):
 			continue
+		var nid = str(node.get_meta("node_id"))
+		var cfg: Dictionary
+		if node == _monitored:
+			# The primary selected object always gets the full UI config.
+			cfg = ui_cfg
+		elif force_all:
+			# Enable toggle: keep the node's own settings, only override "enabled".
+			cfg = _saved_or_default_cfg(nid)
+			cfg["enabled"] = ui_cfg["enabled"]
+		elif changed_keys.size() > 0:
+			# Per-parameter edit: only touch nodes that already have an overlay,
+			# and merge only the changed keys into their own config.
+			cfg = _saved_or_default_cfg(nid)
+			if not cfg.get("enabled", false):
+				continue
+			for key in changed_keys:
+				if ui_cfg.has(key):
+					cfg[key] = ui_cfg[key]
+		else:
+			# Fallback (reset all / paste): full UI config.
+			cfg = ui_cfg
 		if cfg["enabled"]:
 			create_shadow(node, cfg)
 		else:
 			remove_shadow(node)
 		save_data(node, cfg)
+
+func _saved_or_default_cfg(nid: String) -> Dictionary:
+	var cfg: Dictionary
+	if global.ModMapData.has(DATA_KEY) and global.ModMapData[DATA_KEY].has(nid):
+		cfg = global.ModMapData[DATA_KEY][nid].duplicate(true)
+	else:
+		cfg = DEFAULTS.duplicate(true)
+	if cfg.has("shadow_color") and cfg["shadow_color"] is String:
+		cfg["shadow_color"] = Color(cfg["shadow_color"])
+	return cfg
 
 func save_data(obj, cfg: Dictionary) -> void:
 	if not obj.has_meta("node_id"):
