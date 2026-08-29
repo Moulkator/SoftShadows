@@ -7,10 +7,13 @@ extends Reference
 # Bakes a shader-driven shadow Sprite into a plain Sprite with an ImageTexture,
 # so the expensive blur shader stops running every frame for large objects.
 #
-# This file exposes two things:
+# This file exposes three things:
 #
 #   1. ShadowBaker.bake_shadow(...)         — the viewport render + sprite swap
-#   2. ShadowBaker.DebounceManager          — per-prop Timer nodes that fire bake
+#   2. ShadowBaker.bake_shadow_wave(...)    — batch variant: N viewports rendered
+#                                             during the SAME two idle frames,
+#                                             then all read back in one go
+#   3. ShadowBaker.DebounceManager          — per-prop Timer nodes that fire bake
 #                                             requests after a quiet period
 #
 # Typical integration flow in DropShadowObjects.gd:
@@ -25,10 +28,20 @@ extends Reference
 
 
 
+const BUILD := "BAKER-WAVE-1"
+
 const DEBOUNCE_MS := 1500
 # Verbose bake logging. false = silent (default). Flip to true to trace the bake
 # lifecycle (timer fire, viewport build, extract, complete) in the console.
 const BAKE_DIAG := false
+# Premultiplied-alpha diagnostic. When true, every bake samples the captured
+# image and logs, for semi-transparent pixels, the average raw RGB versus the
+# average RGB/alpha, next to the shader's shadow_color. If avg(RGB/A) matches
+# shadow_color while raw RGB is much darker, the capture is premultiplied and
+# the baked sprite is being double-multiplied by alpha at render time.
+# Confirmed premultiplied on 2026-08 (raw_rgb == avg_a for a white shadow);
+# fixed by the PREMULT_ALPHA blend material in _extract_sprite. Keep false.
+const PREMULT_DIAG := false
 
 # Viewports this large still work fine on any modern GPU. Cap exists to prevent
 # runaway memory for props with extreme vertex_scale. 8192 = 256MB at RGBA8.
@@ -55,6 +68,18 @@ const SHADER_PARAMS = [
 	"proj_tex_size",
 	"proj_fade",
 	"proj_extrude",
+	# Free Transform (Unofficial Patch) warp params — MUST be copied or the
+	# bake renders with ft_warp_enabled=0 (the UN-warped silhouette) while the
+	# live shader shows the warped one. All corner/size values are expressed in
+	# the SOURCE sprite's local space, so they are position-independent and can
+	# be copied verbatim into the centred render sprite.
+	"ft_warp_enabled",
+	"ft_corner_tl",
+	"ft_corner_tr",
+	"ft_corner_br",
+	"ft_corner_bl",
+	"ft_tex_size",
+	"ft_center_px",
 ]
 
 # Meta key set on a shadow Sprite after it's been baked. Used so _fast_update_shadow
@@ -97,38 +122,12 @@ static func bake_shadow(shadow_sprite: Sprite, source_sprite: Sprite, global, mo
 		_dbg(mod, "bake: shadow_sprite has no ShaderMaterial, abort")
 		return null
 
-	# Per-axis quad scale. Falls back to a legacy scalar "vertex_scale" param if a
-	# shadow built by an older module version is somehow still around.
-	var vsxy: Vector2 = Vector2.ONE
-	var vsxy_param = mat.get_shader_param("vertex_scale_xy")
-	if vsxy_param is Vector2:
-		vsxy = vsxy_param
-	else:
-		var legacy = mat.get_shader_param("vertex_scale")
-		var lf = float(legacy) if legacy != null else 1.0
-		vsxy = Vector2(lf, lf)
-	if vsxy.x <= 0.0:
-		vsxy.x = 1.0
-	if vsxy.y <= 0.0:
-		vsxy.y = 1.0
-
-	var tex: Texture = source_sprite.texture
-	var tex_size: Vector2 = tex.get_size()
-	if source_sprite.region_enabled:
-		tex_size = source_sprite.region_rect.size
-	if tex_size.x < 1.0 or tex_size.y < 1.0:
-		_dbg(mod, "bake: tex_size degenerate, abort")
+	var viewport_size := compute_viewport_size(shadow_sprite, source_sprite)
+	if viewport_size == Vector2.ZERO:
+		_dbg(mod, "bake: degenerate or oversized viewport, abort")
 		return null
 
-	var viewport_size := Vector2(
-		ceil(tex_size.x * vsxy.x),
-		ceil(tex_size.y * vsxy.y)
-	)
-	if viewport_size.x > MAX_BAKE_DIMENSION or viewport_size.y > MAX_BAKE_DIMENSION:
-		_dbg(mod, "bake: viewport too large %s, abort" % viewport_size)
-		return null
-
-	_dbg(mod, "bake: begin tex=%s vs=%s vp=%s" % [tex_size, vsxy, viewport_size])
+	_dbg(mod, "bake: begin vp=%s" % viewport_size)
 	var tree := global.Editor.get_tree()
 
 	var viewport := _build_viewport(viewport_size)
@@ -152,11 +151,162 @@ static func bake_shadow(shadow_sprite: Sprite, source_sprite: Sprite, global, mo
 	return baked
 
 
+# Size of the bake viewport for this shadow: source texture (or region) scaled
+# by the shader's per-axis quad expansion. Returns Vector2.ZERO when the bake
+# would be invalid (missing sprite/texture/material, degenerate size, or a
+# dimension above MAX_BAKE_DIMENSION). Callers use this both to validate an
+# object before baking and to budget wave sizes without duplicating the maths.
+static func compute_viewport_size(shadow_sprite: Sprite, source_sprite: Sprite) -> Vector2:
+	if shadow_sprite == null or not is_instance_valid(shadow_sprite):
+		return Vector2.ZERO
+	if source_sprite == null or not is_instance_valid(source_sprite) or source_sprite.texture == null:
+		return Vector2.ZERO
+	var mat := shadow_sprite.material as ShaderMaterial
+	if mat == null:
+		return Vector2.ZERO
+
+	# Per-axis quad scale. Falls back to a legacy scalar "vertex_scale" param if a
+	# shadow built by an older module version is somehow still around.
+	var vsxy: Vector2 = Vector2.ONE
+	var vsxy_param = mat.get_shader_param("vertex_scale_xy")
+	if vsxy_param is Vector2:
+		vsxy = vsxy_param
+	else:
+		var legacy = mat.get_shader_param("vertex_scale")
+		var lf = float(legacy) if legacy != null else 1.0
+		vsxy = Vector2(lf, lf)
+	if vsxy.x <= 0.0:
+		vsxy.x = 1.0
+	if vsxy.y <= 0.0:
+		vsxy.y = 1.0
+
+	var tex_size: Vector2 = source_sprite.texture.get_size()
+	if source_sprite.region_enabled:
+		tex_size = source_sprite.region_rect.size
+	if tex_size.x < 1.0 or tex_size.y < 1.0:
+		return Vector2.ZERO
+
+	var viewport_size := Vector2(
+		ceil(tex_size.x * vsxy.x),
+		ceil(tex_size.y * vsxy.y)
+	)
+	if viewport_size.x > MAX_BAKE_DIMENSION or viewport_size.y > MAX_BAKE_DIMENSION:
+		return Vector2.ZERO
+	return viewport_size
+
+
+# Batch bake. Renders every entry's viewport during the SAME two idle frames,
+# then performs all GPU readbacks back-to-back. This is what makes map-load
+# batch bakes fast: N objects cost the same two render frames as one, and the
+# pipeline stalls from get_data() are grouped instead of spread over N frames.
+#
+#   entries: Array of Dictionaries {obj, shadow_sprite, source_sprite}
+#            (obj is only carried through for the caller; not used here)
+#
+# Returns an Array of baked Sprites aligned with `entries` (null where a bake
+# failed or the entry became invalid mid-flight). Call with yield(...).
+# The caller owns wave sizing — keep the summed viewport pixel area bounded
+# (see DropShadowObjects.BAKE_WAVE_MAX_PIXELS) or VRAM spikes.
+static func bake_shadow_wave(entries: Array, global, mod = null) -> Array:
+	# Unconditional first yield — see bake_shadow for why (GDScriptFunctionState).
+	yield(global.Editor.get_tree(), "idle_frame")
+
+	var results := []
+	var viewports := []
+	results.resize(entries.size())
+	viewports.resize(entries.size())
+
+	var tree := global.Editor.get_tree()
+	var built := 0
+	for i in range(entries.size()):
+		var e = entries[i]
+		if not (e is Dictionary):
+			continue
+		var shadow_sprite = e.get("shadow_sprite")
+		var source_sprite = e.get("source_sprite")
+		if shadow_sprite == null or not is_instance_valid(shadow_sprite):
+			continue
+		if source_sprite == null or not is_instance_valid(source_sprite):
+			continue
+		var mat = shadow_sprite.material as ShaderMaterial
+		if mat == null:
+			continue
+		var viewport_size := compute_viewport_size(shadow_sprite, source_sprite)
+		if viewport_size == Vector2.ZERO:
+			continue
+		var viewport := _build_viewport(viewport_size)
+		viewport.add_child(_build_render_sprite(source_sprite, viewport_size, mat))
+		global.Editor.add_child(viewport)
+		viewports[i] = viewport
+		built += 1
+
+	_dbg(mod, "wave: %d/%d viewport(s) built, rendering" % [built, entries.size()])
+	if built > 0:
+		# Two idle frames render ALL the UPDATE_ONCE viewports of this wave.
+		yield(tree, "idle_frame")
+		yield(tree, "idle_frame")
+
+	for i in range(entries.size()):
+		var viewport = viewports[i]
+		if viewport == null or not is_instance_valid(viewport):
+			continue
+		var shadow_sprite = entries[i].get("shadow_sprite")
+		if shadow_sprite != null and is_instance_valid(shadow_sprite):
+			results[i] = _extract_sprite(viewport, shadow_sprite, mod)
+		viewport.queue_free()
+
+	_dbg(mod, "wave: complete")
+	return results
+
+
 static func _dbg(mod, msg: String) -> void:
 	if not BAKE_DIAG:
 		return
 	if mod != null and mod.has_method("outputlog"):
 		mod.outputlog("ShadowBaker: " + msg, 0)
+
+
+# Samples the captured bake image and reports whether semi-transparent pixels
+# look premultiplied (raw RGB darker than RGB/alpha). Logs unconditionally when
+# PREMULT_DIAG is true — the presence of these lines also confirms this build.
+static func _premult_diag(img: Image, shadow_sprite: Sprite, mod) -> void:
+	if mod == null or not mod.has_method("outputlog"):
+		return
+	var color_str := "n/a"
+	var mat = shadow_sprite.material
+	if mat is ShaderMaterial:
+		var sc = mat.get_shader_param("shadow_color")
+		if sc != null:
+			color_str = str(sc)
+	var w := img.get_width()
+	var h := img.get_height()
+	# Cap total samples so huge viewports stay cheap (~1 grid read per cell).
+	var step := int(max(1, floor(sqrt(float(w * h) / 20000.0))))
+	img.lock()
+	var n_semi := 0
+	var sum_a := 0.0
+	var sum_rgb := Vector3.ZERO       # raw captured RGB
+	var sum_rgb_over_a := Vector3.ZERO  # RGB un-premultiplied by alpha
+	var y := 0
+	while y < h:
+		var x := 0
+		while x < w:
+			var c: Color = img.get_pixel(x, y)
+			if c.a > 0.05 and c.a < 0.95:
+				n_semi += 1
+				sum_a += c.a
+				sum_rgb += Vector3(c.r, c.g, c.b)
+				sum_rgb_over_a += Vector3(c.r / c.a, c.g / c.a, c.b / c.a)
+			x += step
+		y += step
+	img.unlock()
+	if n_semi == 0:
+		mod.outputlog("[%s] premult diag: no semi-transparent samples (vp %dx%d, step %d), shadow_color=%s" % [BUILD, w, h, step, color_str], 0)
+		return
+	var inv := 1.0 / float(n_semi)
+	mod.outputlog("[%s] premult diag: vp %dx%d step %d semi=%d avg_a=%.3f raw_rgb=%s rgb_over_a=%s shadow_color=%s" % [
+		BUILD, w, h, step, n_semi, sum_a * inv,
+		str(sum_rgb * inv), str(sum_rgb_over_a * inv), color_str], 0)
 
 
 # Swap shadow_sprite for baked_sprite in the scene tree, preserving index + parent.
@@ -300,6 +450,9 @@ static func _extract_sprite(viewport: Viewport, shadow_sprite: Sprite, mod = nul
 	_dbg(mod, "extract: flip_y")
 	img.flip_y()
 
+	if PREMULT_DIAG:
+		_premult_diag(img, shadow_sprite, mod)
+
 	_dbg(mod, "extract: create_from_image size=%s fmt=%d" % [img.get_size(), img.get_format()])
 	var baked_tex := ImageTexture.new()
 	# FLAG_MIPMAPS on viewport-captured images is a known Godot 3.4 segfault vector.
@@ -310,6 +463,14 @@ static func _extract_sprite(viewport: Viewport, shadow_sprite: Sprite, mod = nul
 	var out := Sprite.new()
 	out.name = shadow_sprite.name
 	out.texture = baked_tex
+	# The viewport capture is premultiplied: the shader output was blended onto
+	# a transparent-black background, so every semi-transparent pixel stores
+	# RGB * A. Rendering that with the default (straight alpha) blend multiplies
+	# by A a second time — visible as a dark layer under any non-black shadow.
+	# PREMULT_ALPHA blend (src=ONE) renders the captured data correctly.
+	var blend_mat := CanvasItemMaterial.new()
+	blend_mat.blend_mode = CanvasItemMaterial.BLEND_MODE_PREMULT_ALPHA
+	out.material = blend_mat
 	out.centered = shadow_sprite.centered
 	out.position = shadow_sprite.position
 	out.rotation = shadow_sprite.rotation

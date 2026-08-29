@@ -54,10 +54,24 @@ func initialise():
 		outputlog("level_settings_patch missing — controls not built", 0)
 
 	# Global bake controls (resolution slider + Render/Unbake buttons).
+	# Wrapped in a MarginContainer: the section's buttons and dropdown were
+	# touching the panel's right edge (ShadowBakeAll adds its controls flush).
 	if core != null and core.get("shadow_bake_all") != null:
-		core.shadow_bake_all.build_controls(container)
+		var ba_margin = MarginContainer.new()
+		ba_margin.add_constant_override("margin_right", 10)
+		ba_margin.add_constant_override("margin_left", 2)
+		ba_margin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		var ba_vbox = VBoxContainer.new()
+		ba_margin.add_child(ba_vbox)
+		container.add_child(ba_margin)
+		core.shadow_bake_all.build_controls(ba_vbox)
 
-	outputlog("Soft Shadows tool created in Effects category", 0)
+	# Bottom section (Simple shadow size cap) — added LAST so it sits below
+	# the Bake All Shadows block at the very bottom of the tool panel.
+	if level_settings_patch != null and level_settings_patch.has_method("build_bottom_controls"):
+		level_settings_patch.build_bottom_controls(container)
+
+	outputlog("[BUILD: TOOL-CAPROW-2] Soft Shadows tool created in Effects category", 0)
 
 #########################################################################################################
 ## DD TOOL CALLBACKS — no-ops (settings panel, no canvas behaviour)

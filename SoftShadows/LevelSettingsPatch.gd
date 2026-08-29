@@ -64,6 +64,11 @@ const BAKE_MODE_MANUAL = 2
 const GLOBAL_CFG_PATH = "user://dropshadow_softshadows.cfg"
 const GLOBAL_CFG_SECTION = "rendering"
 const GLOBAL_CFG_MODE_KEY = "bake_mode"
+# "Simple Sliders" UI style for Simple mode: 0 = classic Spread + Softness,
+# 1 = single Blur slider (absolute pixels, like the realistic blur).
+# Stored PER MAP like the cap: Blur on maps with no existing SoftShadows
+# data, classic on legacy maps.
+const SIMPLE_STYLE_KEY = "DropShadowSliderStyle"   # per-map int (0/1)
 
 const ASSET_TYPES = ["objects", "walls", "paths", "roofs"]
 
@@ -112,6 +117,8 @@ var _rendering_apply_frame: PanelContainer = null  # "Apply" — bake now (Auto 
 var _bake_scope_option: OptionButton = null  # All / Current / Other (manual only)
 var _bake_button: Button = null
 var _bake_manual_row: HBoxContainer = null
+var _slider_style_option: OptionButton = null  # "Simple Sliders" dropdown
+var simple_slider_style: int = 0             # 0 = Spread + Softness, 1 = Blur
 
 # Poll cadence for "is the LevelSettings panel built yet?" — fires from
 # Core.update(delta) at most a few times before injection succeeds.
@@ -138,6 +145,11 @@ func initialise():
 	# so the choice carries over between maps. Runs before the modules create
 	# shadows (gating reads ModMapData[BAKE_MODE_KEY]) and before the tool UI.
 	global.ModMapData[BAKE_MODE_KEY] = _load_global_bake_mode()
+	_seed_slider_style()
+	# The tool panels are built before the per-map style is known: notify the
+	# modules once everything is wired so their rows match the seeded style.
+	call_deferred("_notify_slider_style_to_modules")
+	outputlog("[BUILD: LSP-SIMPLEBLUR-4]", 0)
 	_cloud_icon_on    = _build_cloud_icon_variant("on")
 	_cloud_icon_off   = _build_cloud_icon_variant("off")
 	_cloud_icon_hover = _build_cloud_icon_variant("hover")
@@ -355,6 +367,39 @@ func _load_icon_from_disk(path: String) -> Texture:
 	texture.create_from_image(image)
 	outputlog("Icon loaded: %s (%dx%d)" % [path, image.get_width(), image.get_height()], 0)
 	return texture
+
+
+# Small clickable info icon (icons/info.png): clicking toggles an inline
+# explanation label in the panel (returned alongside the button; the caller
+# places the label below the row). Falls back to a "?" button if the icon is
+# missing. Returns [icon_button, description_label].
+func _make_info_toggle(text: String) -> Array:
+	var lbl = Label.new()
+	lbl.text = text
+	lbl.autowrap = true
+	lbl.visible = false
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.add_color_override("font_color", Color(0.7, 0.7, 0.7, 1.0))
+	var tex = _load_icon_from_disk("icons/info.png")
+	var btn
+	if tex != null:
+		btn = TextureButton.new()
+		btn.texture_normal = tex
+		btn.expand = true
+		btn.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
+		btn.rect_min_size = Vector2(18, 18)
+		btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	else:
+		btn = Button.new()
+		btn.text = "?"
+	btn.hint_tooltip = "Show/hide details."
+	btn.connect("pressed", self, "_on_info_toggle", [lbl])
+	return [btn, lbl]
+
+
+func _on_info_toggle(lbl):
+	if lbl != null and is_instance_valid(lbl):
+		lbl.visible = not lbl.visible
 
 
 # Builds a tinted cloud icon. Three states:
@@ -938,6 +983,45 @@ func build_tool_controls(container):
 		margin.add_child(_injected_root)
 		container.add_child(margin)
 
+# Bottom section of the Soft Shadows tool. Called by SoftShadowsTool AFTER
+# ShadowBakeAll.build_controls so this lands at the very bottom of the panel.
+# Cap the softness reach of Simple wall/path shadows: the value is the
+# softness size in pixels AT THE DEFAULT Softness setting (2.75); higher
+# Softness values scale proportionally, so the per-shadow Softness slider
+# keeps its full effect. OFF by default: existing maps stay untouched.
+func build_bottom_controls(container):
+	var margin = MarginContainer.new()
+	margin.add_constant_override("margin_top", 4)
+	margin.add_constant_override("margin_right", 10)
+	margin.add_constant_override("margin_left", 2)
+	margin.add_constant_override("margin_bottom", 4)
+	var vb = VBoxContainer.new()
+	vb.add_constant_override("separation", 6)
+	vb.add_child(HSeparator.new())
+
+	# Row: "Simple Sliders" UI style for Simple mode. [label] [info] [dropdown]
+	var style_row = HBoxContainer.new()
+	style_row.add_constant_override("separation", 6)
+	var style_lbl = Label.new()
+	style_lbl.text = "Simple Sliders:"
+	style_row.add_child(style_lbl)
+	var style_info = _make_info_toggle("Chooses the Simple-mode size controls. Spread + Softness: two sliders, shadow size is relative to the wall/path width. Blur: one slider in absolute pixels, like the Realistic blur. Each shadow keeps the style it was edited in until one of its size sliders is touched.")
+	style_row.add_child(style_info[0])
+	_slider_style_option = OptionButton.new()
+	_slider_style_option.add_item("Spread + Softness", 0)
+	_slider_style_option.add_item("Blur", 1)
+	_slider_style_option.selected = simple_slider_style
+	_slider_style_option.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_slider_style_option.hint_tooltip = "Simple-mode size controls."
+	_slider_style_option.connect("item_selected", self, "_on_slider_style_changed")
+	style_row.add_child(_slider_style_option)
+	vb.add_child(style_row)
+	vb.add_child(style_info[1])
+
+	margin.add_child(vb)
+	if container != null:
+		container.add_child(margin)
+
 #########################################################################################################
 ## TREE DECORATION (cloud icon per level row)
 #########################################################################################################
@@ -1152,6 +1236,47 @@ func _save_global_bake_mode(mode):
 	cfg.set_value(GLOBAL_CFG_SECTION, GLOBAL_CFG_MODE_KEY, int(mode))
 	if cfg.save(GLOBAL_CFG_PATH) != OK:
 		outputlog("Could not save rendering mode preference", 0)
+
+
+# True when this map already contains SoftShadows per-node data — used to
+# seed new features conservatively (preserve the look of legacy maps).
+func _map_has_legacy_shadow_data() -> bool:
+	var sd = global.ModMapData.get(SHADOW_DATA_KEYS["walls"], null)
+	return sd is Dictionary and sd.size() > 0
+
+
+# Seed the "Simple Sliders" style from the map: Blur on fresh maps, classic
+# on legacy ones. Stored so the choice sticks with the map once saved.
+func _seed_slider_style():
+	if global.ModMapData.has(SIMPLE_STYLE_KEY):
+		simple_slider_style = int(clamp(int(global.ModMapData[SIMPLE_STYLE_KEY]), 0, 1))
+		return
+	simple_slider_style = 0 if _map_has_legacy_shadow_data() else 1
+	global.ModMapData[SIMPLE_STYLE_KEY] = simple_slider_style
+
+
+# Accessor used by the modules: true when the Simple mode uses the single
+# Blur slider (absolute pixels) instead of Spread + Softness.
+func is_simple_blur_style() -> bool:
+	return simple_slider_style == 1
+
+
+func _notify_slider_style_to_modules():
+	if dropshadow_paths != null and dropshadow_paths.has_method("on_simple_slider_style_changed"):
+		dropshadow_paths.on_simple_slider_style_changed()
+	if dropshadow_walls != null and dropshadow_walls.has_method("on_simple_slider_style_changed"):
+		dropshadow_walls.on_simple_slider_style_changed()
+
+
+func _on_slider_style_changed(index: int):
+	simple_slider_style = int(clamp(index, 0, 1))
+	global.ModMapData[SIMPLE_STYLE_KEY] = simple_slider_style
+	# Modules swap their panel rows. No rebuild: each shadow keeps its
+	# authored style until one of its size sliders is touched.
+	if dropshadow_paths != null and dropshadow_paths.has_method("on_simple_slider_style_changed"):
+		dropshadow_paths.on_simple_slider_style_changed()
+	if dropshadow_walls != null and dropshadow_walls.has_method("on_simple_slider_style_changed"):
+		dropshadow_walls.on_simple_slider_style_changed()
 
 
 # Initialise the dropdown from the persisted mode (default AUTO).

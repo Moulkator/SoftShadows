@@ -25,7 +25,22 @@ const SHADOW_DATA_KEY = "DropShadow"
 # Shape (projected) mode: paintable height-zone grid + mesh subdivision.
 const SHAPE_GRID = 12        # editor cells per axis (paint HIGH/LOW)
 const SHAPE_MESH_SUBDIV = 24 # mesh quads per axis (silhouette warp resolution)
-const PROJ_MAX_LENGTH = 1.5  # max projection length (dial radius -> length)
+const PROJ_MAX_LENGTH = 4.0  # max projection length (dial radius -> length)
+# Dial radius->length curve exponent. length = frac^EXP * MAX (frac = 0..1 radius).
+# Higher = finer/gentler control near the centre, steeper near the rim.
+const PROJ_DIAL_EXP = 4.0
+# Non-uniform distance ladder for the projected "Distance" SpinBox arrows: very
+# fine near 0, progressively coarser. Native step stays small (dial/typing
+# resolution); arrow clicks are remapped onto this ladder in _on_proj_dist_changed().
+#   0..0.1 step 0.01 | 0.1..1 step 0.1 | 1..3 step 0.2 | 3..10 step 0.5
+const PROJ_DIST_LADDER = [
+	0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1,
+	0.12, 0.14, 0.16, 0.18,
+	0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+	0.5, 0.6, 0.7, 0.8, 0.9, 1,
+	1.2, 1.4, 1.6, 1.8, 2, 2.2, 2.4, 2.6, 2.8, 3,
+	3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10
+]
 
 # Global bake-mode (objects-only). Persisted in ModMapData by LevelSettingsPatch,
 # read here to gate the auto-bake debounce. Default AUTO preserves prior behaviour.
@@ -110,6 +125,9 @@ var _last_monitored_object = null
 var _monitored_type = ""
 var _heal_counter = 0  # throttles the missing-shadow self-heal scan
 var _syncing_ui = false
+# Last committed projected-distance value; used to detect SpinBox arrow direction
+# so arrow clicks can be remapped onto PROJ_DIST_LADDER.
+var _proj_dist_prev = 0.0
 var _loading_ui = false  # blocks apply_shadow_to_selected during UI load
 var _clipboard = {}
 var _all_known_obj_ids = {}
@@ -130,6 +148,9 @@ var _pending_signal_nodes = []  # nodes from OnAssignNode to check
 var _ctrl_v_was_pressed = false  # anti-bounce for key detection
 var _ctrl_c_was_pressed = false
 var _clone_batch = []  # nodes detected as new in current tick
+var _last_next_node_id = -1  # World.nextNodeID watcher (dirty flag only) for ScatterBrush mod detection
+var _scatter_tool_was_active = false  # previous-tick ScatterTool state (baseline trigger)
+var _scatter_baseline_level = null  # level the last baseline pass was taken on
 var _opaque_center_cache = {}  # texture RID -> Vector2 offset (in texture pixels)
 
 # Logging
@@ -173,8 +194,13 @@ var _baker_script = null
 
 func initialise() -> void:
 	outputlog("Drop Shadow Objects initialising...")
+	# Cross-mod API: let other mods (e.g. Theme Search auto-placement)
+	# apply soft shadows to objects they create. Overwriting on each map
+	# load is fine: submods are References, the stale one just gets
+	# released.
+	Engine.set_meta("dropshadow_objects_singleton", self)
 	printraw("(%d) " % OS.get_ticks_msec())
-	print("[BUILD: OBJECTS-FACTORY-RESET-1]")
+	print("[BUILD: OBJECTS-TOOLCOG-2]")
 
 	# Load the shader
 	_shadow_shader = ResourceLoader.load(global.Root + "shaders/DropShadowObject.shader", "Shader", true)
@@ -243,7 +269,7 @@ void fragment() {
 	if global.World.has_signal("OnAssignNode"):
 		global.World.connect("OnAssignNode", self, "_on_new_node_added")
 
-	outputlog("Drop Shadow Objects initialised. [BUILD: proj-live-peraxis]", 0)
+	outputlog("Drop Shadow Objects initialised. [BUILD: OBJECTS-TOOLCOG-2]", 0)
 
 
 #########################################################################################################
@@ -396,11 +422,20 @@ func _apply_projection_params(mat: ShaderMaterial, obj, config: Dictionary, spri
 	var world_dir = Vector2(cos(ang), sin(ang))
 	var local_dir = obj.global_transform.affine_inverse().basis_xform(world_dir)
 	local_dir = local_dir.normalized() if local_dir.length() > 0.0001 else Vector2(0.0, 1.0)
-	# Ancre normalisée [-1..1] -> px relatifs au centre texture (uv 0.5 = centre)
+	# Ancre normalisée [-1..1] -> px relatifs au centre texture (uv 0.5 = centre).
+	# Décalée sur le centre de la silhouette OPAQUE : pour un PNG avec du padding
+	# transparent asymétrique, le centre de la texture peut tomber près du bord de
+	# la silhouette (voire dehors). En mode stretch, tout point de silhouette à
+	# a > 0 est étiré à a*(1+L) : avec une ancre hors silhouette d'un côté, le
+	# bord proche part à bord*(1+L) et l'ombre se DÉTACHE de l'asset d'un écart
+	# bord*L — un trou d'un seul côté (espace texture) qui grandit avec la
+	# distance. Centrer l'ancre sur la silhouette supprime le détachement et rend
+	# l'ancre UI relative à l'asset visible plutôt qu'au PNG.
+	var opaque_off = _get_opaque_center_offset(sprite)
 	var anchor_px = Vector2(
 		config.get("proj_anchor_x", 0.0) * tex_size.x * 0.5,
 		config.get("proj_anchor_y", 0.0) * tex_size.y * 0.5
-	)
+	) + opaque_off
 	mat.set_shader_param("proj_enabled", 1.0)
 	mat.set_shader_param("proj_dir", local_dir)
 	mat.set_shader_param("proj_length", config.get("proj_length", 0.0))
@@ -553,6 +588,81 @@ func _create_shape_shadow(obj, config: Dictionary) -> void:
 	obj.set_meta("_shadow_config", config)
 	save_shadow_data(obj, config)
 
+#########################################################################################################
+##
+## FREE TRANSFORM (UNOFFICIAL PATCH) WARP COMPAT
+##
+#########################################################################################################
+# FT's distort/perspective/skew warps the asset via a bilinear corner warp in
+# the asset's own material, and publishes the corners (sprite-local px,
+# +/-real_size/2 space) in ModMapData["_ft_distort"], keyed "node-id-<id>".
+# The shadow shader carries the matching inverse warp (ft_* uniforms) so the
+# shadow shows the WARPED silhouette. All of this is a no-op when FT is absent
+# or the object isn't distorted.
+
+func _ft_warp_signature(obj):
+	# Returns the FT distort corner array [8 floats] for obj, or null.
+	# Cheap when FT isn't used: one dictionary get on an absent key.
+	var store = global.ModMapData.get("_ft_distort", null)
+	if store == null or not (store is Dictionary) or store.empty():
+		return null
+	if not obj.has_meta("node_id"):
+		return null
+	# Cache the key string — this runs in the per-frame pre-draw scan.
+	var key = obj.get_meta("_shadow_ft_key") if obj.has_meta("_shadow_ft_key") else ""
+	if key == "":
+		key = "node-id-" + str(obj.get_meta("node_id"))
+		obj.set_meta("_shadow_ft_key", key)
+	var raw = store.get(key, null)
+	if raw is Array and raw.size() == 8:
+		return raw
+	return null
+
+
+func _apply_ft_warp_params(mat, obj, sprite) -> void:
+	# Push (or clear) the FT warp params on a shadow material.
+	if mat == null or not (mat is ShaderMaterial) or sprite == null:
+		return
+	var raw = _ft_warp_signature(obj)
+	if raw == null:
+		mat.set_shader_param("ft_warp_enabled", 0.0)
+		return
+	var srect = sprite.get_rect()
+	mat.set_shader_param("ft_warp_enabled", 1.0)
+	mat.set_shader_param("ft_corner_tl", Vector2(raw[0], raw[1]))
+	mat.set_shader_param("ft_corner_tr", Vector2(raw[2], raw[3]))
+	mat.set_shader_param("ft_corner_br", Vector2(raw[4], raw[5]))
+	mat.set_shader_param("ft_corner_bl", Vector2(raw[6], raw[7]))
+	mat.set_shader_param("ft_tex_size", srect.size)
+	mat.set_shader_param("ft_center_px", srect.position + srect.size * 0.5)
+
+
+func _refresh_shadow_ft_warp(obj) -> void:
+	# Deferred from the pre-draw scan (same pattern as the rotation refresh):
+	# push the new warp corners on the live shader. If the shadow is baked, the
+	# old warp is burned into the baked texture — unbake first, then let the
+	# usual debounced auto-bake re-bake after the gesture.
+	if obj == null or not is_instance_valid(obj):
+		return
+	if not obj.has_meta(SHADOW_META_KEY):
+		return
+	var sprite = get_sprite(obj)
+	if sprite == null:
+		return
+	if _baker_script.is_baked(obj, SHADOW_META_KEY):
+		_baker_script.unbake(obj, SHADOW_META_KEY, sprite)
+	var nodes = obj.get_meta(SHADOW_META_KEY)
+	if not (nodes is Array):
+		return
+	for node in nodes:
+		if is_instance_valid(node) and node.material is ShaderMaterial:
+			_apply_ft_warp_params(node.material, obj, sprite)
+	var cfg = obj.get_meta("_shadow_config") if obj.has_meta("_shadow_config") else null
+	var projected = cfg is Dictionary and cfg.get("shadow_mode", "offset") == "projected"
+	if not projected and obj != _obj_tool_preview_node and _should_auto_bake():
+		_bake_debounce.schedule_bake(obj)
+
+
 func create_shadow(obj, config: Dictionary):
 	if obj == null or not is_instance_valid(obj):
 		return
@@ -644,7 +754,21 @@ func create_shadow(obj, config: Dictionary):
 	mat.set_shader_param("blur_steps", blur_steps)
 	mat.set_shader_param("vertex_scale_xy", vsxy)
 	mat.set_shader_param("extrude_steps", extrude_steps)
+	# Anchor of the shader's quad expansion (see quad_center_px in the shader).
+	# Derived from the ENGINE's drawn rect (get_rect), not recomputed from
+	# offset/centered: with pixel snap, Godot floors the rect position — for an
+	# ODD texture size (e.g. 241x249) the drawn quad centre lands 0.5px off the
+	# theoretical centre. The shader's UV remap then drifts by (vs-1)*0.5px,
+	# shifting the whole shadow (body AND under-asset cut) up-left by an amount
+	# growing with the projected distance — the one-sided junction gap.
+	var srect = sprite.get_rect()
+	var quad_center = srect.position + srect.size * 0.5
+	mat.set_shader_param("quad_center_px", quad_center)
 	_apply_projection_params(mat, obj, config, sprite, tex_size)
+	# Free Transform warp (no-op when the object isn't distorted). Seed the
+	# change-detection meta so the pre-draw scan doesn't re-trigger right away.
+	_apply_ft_warp_params(mat, obj, sprite)
+	obj.set_meta("_shadow_ft_sig", _ft_warp_signature(obj))
 	shadow_sprite.material = mat
 
 	# Store meta
@@ -744,8 +868,12 @@ func _compute_vertex_scale_xy(obj, config: Dictionary, tex_size: Vector2, shader
 	var blur_margin = shader_blur * blur_ratio * 1.5
 	# Rotate the (h_along × h_perp) box into local axes, take AABB half-extents,
 	# add the isotropic blur margin. perp = (-ldir.y, ldir.x).
-	var half_x = h_along * adx + h_perp * ady + blur_margin
-	var half_y = h_along * ady + h_perp * adx + blur_margin
+	# Off-centre silhouettes (transparent padding in the PNG): the anchor now sits
+	# on the opaque centre, so the cast body is offset from the texture centre by
+	# up to |opaque_off| — widen the symmetric quad accordingly.
+	var vs_opaque_off = _get_opaque_center_offset(get_sprite(obj))
+	var half_x = h_along * adx + h_perp * ady + blur_margin + abs(vs_opaque_off.x)
+	var half_y = h_along * ady + h_perp * adx + blur_margin + abs(vs_opaque_off.y)
 	# Cap absolute px reach (fragment count + bake viewport). Floor at the silhouette.
 	half_x = clamp(half_x, tex_size.x * 0.75, MAX_PROJ_HALF_PX)
 	half_y = clamp(half_y, tex_size.y * 0.75, MAX_PROJ_HALF_PX)
@@ -813,14 +941,14 @@ func _set_shadow_sprite_custom_rect(shadow_sprite, vertex_scale_xy: Vector2) -> 
 	if ts.x < 1.0 or ts.y < 1.0:
 		return
 	# Rect du quad en coords LOCALES px (pré-transform), comme VERTEX. Le shader
-	# scale VERTEX autour de l'origine locale (0,0), par axe. L'offset/position et
-	# le scale du sprite sont appliqués ensuite par sa Transform2D, comme VERTEX.
-	var base_pos = shadow_sprite.offset
-	if shadow_sprite.centered:
-		base_pos = base_pos - ts * 0.5
+	# scale VERTEX autour du CENTRE du quad (quad_center_px), par axe. On part du
+	# rect MOTEUR (get_rect, floor du pixel snap inclus — cf. create_shadow) :
+	# le rect scalé vaut centre ± rect.size*vs/2.
+	var srect2 = shadow_sprite.get_rect()
+	var qc = srect2.position + srect2.size * 0.5
 	var rect = Rect2(
-		Vector2(base_pos.x * vertex_scale_xy.x, base_pos.y * vertex_scale_xy.y),
-		Vector2(ts.x * vertex_scale_xy.x, ts.y * vertex_scale_xy.y)
+		Vector2(qc.x - srect2.size.x * vertex_scale_xy.x * 0.5, qc.y - srect2.size.y * vertex_scale_xy.y * 0.5),
+		Vector2(srect2.size.x * vertex_scale_xy.x, srect2.size.y * vertex_scale_xy.y)
 	)
 	VisualServer.canvas_item_set_custom_rect(shadow_sprite.get_canvas_item(), true, rect)
 
@@ -1577,16 +1705,38 @@ func bake_object_now(obj):
 	_baker_script.install_baked(obj, shadow_sprite, baked, SHADOW_META_KEY)
 
 
-# Single serial bake queue. Overlapping callers (map-load + enable, or several
-# enables) merge into one queue, so at most one viewport is ever alive. Pending
-# auto-bake debounces for queued objects are cancelled up front so they can't
-# fire in parallel with the queue.
+# Single bake queue, drained in WAVES. Overlapping callers (map-load + enable,
+# or several enables) merge into one queue. Each wave renders up to
+# BAKE_WAVE_MAX_OBJECTS viewports during the same two idle frames (via
+# ShadowBaker.bake_shadow_wave), as long as their summed pixel area stays under
+# BAKE_WAVE_MAX_PIXELS. An object whose viewport alone exceeds the pixel budget
+# gets a wave to itself — never worse than the old one-object-at-a-time path.
+# Pending auto-bake debounces for queued objects are cancelled up front so they
+# can't fire in parallel with the queue.
+const BAKE_WAVE_MAX_OBJECTS := 24
+# 16 Mpx of summed viewport area per wave = ~64 MB of transient RGBA8 VRAM.
+const BAKE_WAVE_MAX_PIXELS := 8000000.0
+
+# Progress popup shown while the bake queue drains (map load / batch bakes).
+# Only appears when at least this many objects are queued, so small batches
+# don't flash a popup for a fraction of a second.
+const BAKE_PROGRESS_MIN_OBJECTS := 8
+
 var _bake_queue = []        # Array of WeakRef to object owners
 var _bake_running = false
+var _bake_total = 0         # objects enqueued since the current drain started
+var _bake_consumed = 0      # queue items consumed so far (baked or skipped)
+var _bake_progress_panel = null
+var _bake_progress_bar = null
+var _bake_progress_label = null
 
 func bake_objects_sequential(obj_list):
 	if obj_list == null:
 		return
+	# A fresh drain is about to start — restart the progress counters.
+	if not _bake_running:
+		_bake_total = 0
+		_bake_consumed = 0
 	for obj in obj_list:
 		if obj == null or not is_instance_valid(obj):
 			continue
@@ -1598,6 +1748,7 @@ func bake_objects_sequential(obj_list):
 		if _bake_debounce != null:
 			_bake_debounce.cancel(obj)
 		_bake_queue.append(weakref(obj))
+		_bake_total += 1
 	if not _bake_running:
 		_drain_bake_queue()
 
@@ -1609,17 +1760,158 @@ func _drain_bake_queue():
 	yield(global.Editor.get_tree(), "idle_frame")
 	var tree = global.Editor.get_tree()
 	var done = 0
+	var waves = 0
 	while _bake_queue.size() > 0:
-		var ref = _bake_queue.pop_front()
-		var obj = ref.get_ref() if ref != null else null
-		if obj == null or not is_instance_valid(obj):
+		# Popup: open lazily so mid-drain enqueues that push the total past the
+		# threshold still get a bar.
+		if _bake_progress_panel == null and _bake_total >= BAKE_PROGRESS_MIN_OBJECTS:
+			_bake_progress_open()
+		# Build one wave under the object/pixel budgets. Peek before popping so
+		# an entry that doesn't fit stays at the head for the next wave.
+		var entries = []
+		var wave_px = 0.0
+		while _bake_queue.size() > 0 and entries.size() < BAKE_WAVE_MAX_OBJECTS:
+			var ref = _bake_queue[0]
+			var obj = ref.get_ref() if ref != null else null
+			var entry = _make_bake_entry(obj)
+			if entry == null:
+				# Ineligible (freed, already baked, projected, ...) — drop it.
+				_bake_queue.pop_front()
+				_bake_consumed += 1
+				continue
+			var px = entry["vp_size"].x * entry["vp_size"].y
+			if entries.size() > 0 and wave_px + px > BAKE_WAVE_MAX_PIXELS:
+				break
+			_bake_queue.pop_front()
+			_bake_consumed += 1
+			entries.append(entry)
+			wave_px += px
+		if entries.size() == 0:
+			_bake_progress_update()
 			continue
-		yield(bake_object_now(obj), "completed")
-		done += 1
-		# Give the freed viewport a frame to release its memory before the next.
+		waves += 1
+		var baked_list = yield(_baker_script.bake_shadow_wave(entries, global, self), "completed")
+		for i in range(entries.size()):
+			var baked = null
+			if baked_list is Array and i < baked_list.size():
+				baked = baked_list[i]
+			if baked == null:
+				continue
+			var obj = entries[i]["obj"]
+			var shadow_sprite = entries[i]["shadow_sprite"]
+			if not is_instance_valid(obj) or not is_instance_valid(shadow_sprite):
+				baked.queue_free()
+				continue
+			_baker_script.install_baked(obj, shadow_sprite, baked, SHADOW_META_KEY)
+			done += 1
+		_bake_progress_update()
+		# Give the freed viewports a frame to release their memory before the
+		# next wave.
 		yield(tree, "idle_frame")
 	_bake_running = false
-	outputlog("Batch bake: processed %d object(s)" % done, 0)
+	_bake_progress_close()
+	outputlog("Batch bake: processed %d object(s) in %d wave(s)" % [done, waves], 0)
+
+
+# Validate an object for wave baking (same eligibility rules as bake_object_now)
+# and pre-compute its viewport size for wave budgeting. Cancels any pending
+# auto-bake debounce so it can't fire in parallel with the wave. Returns
+# {obj, shadow_sprite, source_sprite, vp_size} or null when ineligible.
+func _make_bake_entry(obj):
+	if obj == null or not is_instance_valid(obj):
+		return null
+	if _baker_script == null:
+		return null
+	if not obj.has_meta(SHADOW_META_KEY):
+		return null
+	if _baker_script.is_baked(obj, SHADOW_META_KEY):
+		return null
+	# Projected shadows stay live — never bake them (see bake_object_now).
+	if obj.has_meta("_shadow_config"):
+		var wccfg = obj.get_meta("_shadow_config")
+		if wccfg is Dictionary and wccfg.get("shadow_mode", "offset") == "projected":
+			return null
+	if _bake_debounce != null:
+		_bake_debounce.cancel(obj)
+	var nodes = obj.get_meta(SHADOW_META_KEY)
+	if not (nodes is Array) or nodes.size() == 0:
+		return null
+	var shadow_sprite = nodes[0]
+	if shadow_sprite == null or not is_instance_valid(shadow_sprite):
+		return null
+	var source_sprite = get_sprite(obj)
+	if source_sprite == null:
+		return null
+	var vp_size = _baker_script.compute_viewport_size(shadow_sprite, source_sprite)
+	if vp_size == Vector2.ZERO:
+		return null
+	return {"obj": obj, "shadow_sprite": shadow_sprite, "source_sprite": source_sprite, "vp_size": vp_size}
+
+
+# Centered "Baking shadows" popup for the wave bake queue. Same visual style as
+# the ShadowBakeAll loading popup. No per-frame easing needed: the bar is set
+# directly at each wave boundary (every ~3-4 frames), which reads as smooth.
+func _bake_progress_open():
+	_bake_progress_close()
+	if global.Editor == null:
+		return
+	var panel = Panel.new()
+	panel.rect_size = Vector2(340, 96)
+	# Opaque dark background so the map doesn't show through the popup.
+	var sb = StyleBoxFlat.new()
+	sb.bg_color = Color(0.11, 0.11, 0.12, 0.98)
+	sb.border_color = Color(0, 0, 0, 0.9)
+	sb.border_width_left = 1
+	sb.border_width_top = 1
+	sb.border_width_right = 1
+	sb.border_width_bottom = 1
+	sb.corner_radius_top_left = 6
+	sb.corner_radius_top_right = 6
+	sb.corner_radius_bottom_left = 6
+	sb.corner_radius_bottom_right = 6
+	panel.add_stylebox_override("panel", sb)
+	var vb = VBoxContainer.new()
+	vb.set_anchors_and_margins_preset(Control.PRESET_WIDE)
+	vb.margin_left = 16
+	vb.margin_top = 16
+	vb.margin_right = -16
+	vb.margin_bottom = -16
+	var lbl = Label.new()
+	lbl.text = "Baking shadows, please wait..."
+	vb.add_child(lbl)
+	var bar = ProgressBar.new()
+	bar.min_value = 0
+	bar.max_value = 100
+	bar.value = 0
+	vb.add_child(bar)
+	panel.add_child(vb)
+	global.Editor.add_child(panel)
+	var vp = global.Editor.get_viewport().get_visible_rect().size
+	panel.rect_position = ((vp - panel.rect_size) / 2.0).floor()
+	_bake_progress_panel = panel
+	_bake_progress_bar = bar
+	_bake_progress_label = lbl
+	_bake_progress_update()
+
+
+func _bake_progress_update():
+	if _bake_progress_bar == null or not is_instance_valid(_bake_progress_bar):
+		return
+	var total = max(_bake_total, 1)
+	var consumed = int(clamp(_bake_consumed, 0, total))
+	_bake_progress_bar.value = 100.0 * float(consumed) / float(total)
+	if _bake_progress_label != null and is_instance_valid(_bake_progress_label):
+		_bake_progress_label.text = "Baking shadows, please wait. (%d / %d)" % [consumed, total]
+
+
+func _bake_progress_close():
+	if _bake_progress_panel != null and is_instance_valid(_bake_progress_panel):
+		if _bake_progress_panel.get_parent() != null:
+			_bake_progress_panel.get_parent().remove_child(_bake_progress_panel)
+		_bake_progress_panel.queue_free()
+	_bake_progress_panel = null
+	_bake_progress_bar = null
+	_bake_progress_label = null
 
 
 func _fast_update_shadow(obj, config: Dictionary) -> bool:
@@ -1701,7 +1993,12 @@ func _fast_update_shadow(obj, config: Dictionary) -> bool:
 			mat.set_shader_param("blur_steps", blur_steps)
 			mat.set_shader_param("vertex_scale_xy", vsxy)
 			mat.set_shader_param("extrude_steps", extrude_steps)
+			# Anchor of the shader's quad expansion — engine-truth rect centre
+			# (see the matching block in create_shadow for the odd-size rationale).
+			var fu_rect = sprite.get_rect()
+			mat.set_shader_param("quad_center_px", fu_rect.position + fu_rect.size * 0.5)
 			_apply_projection_params(mat, obj, config, sprite, tex_size)
+			_apply_ft_warp_params(mat, obj, sprite)
 			mat.set_shader_param("cut_offset", Vector2.ZERO if projected else Vector2(local_offset.x / tex_size.x, local_offset.y / tex_size.y))
 			# Shadow stays as a child of obj. behind_layer just toggles relative
 			# z-index between 0 (same z bucket as prop) and -1 (one bucket below).
@@ -1717,13 +2014,17 @@ func _fast_update_shadow(obj, config: Dictionary) -> bool:
 	obj.set_meta("_shadow_offset", offset)
 	obj.set_meta("_shadow_config", config)
 	_update_custom_rect(obj, sprite, total_blur, max(vsxy.x, vsxy.y))
-	save_shadow_data(obj, config)
+	# The ObjectTool/ScatterBrush ghost must never be persisted to ModMapData nor
+	# scheduled for a bake (same guard as create_shadow) — it's now also fast-
+	# updated on rotation, which routes through here.
+	if obj != _obj_tool_preview_node:
+		save_shadow_data(obj, config)
 	# Projected shadows stay live (see create_shadow). Switching INTO projected
 	# cancels any bake still pending from offset; only offset auto-bakes.
 	if config.get("shadow_mode", "offset") == "projected":
 		if _bake_debounce != null:
 			_bake_debounce.cancel(obj)
-	elif _should_auto_bake():
+	elif obj != _obj_tool_preview_node and _should_auto_bake():
 		_bake_debounce.schedule_bake(obj)
 	return true
 
@@ -1800,6 +2101,7 @@ func _on_monitor_tick():
 		if _obj_tool_preview_node != null and not is_instance_valid(_obj_tool_preview_node):
 			_obj_tool_preview_node = null
 			_obj_tool_preview_tex = null
+			_obj_tool_preview_rot = null
 		var preview = _get_obj_tool_preview()
 		if preview != null:
 			# Check if texture changed (asset swap without node change)
@@ -1807,15 +2109,26 @@ func _on_monitor_tick():
 			var spr = get_sprite(preview)
 			if spr != null and spr.texture != null:
 				current_tex = spr.texture.get_rid()
+			# Rotation/mirror of the ghost: refresh params in place (proj_dir, quad
+			# extents, cut). Recreating the sprite here caused a one-frame flicker
+			# on every rotation step — only node/texture changes recreate now.
+			var current_rot = Vector3(preview.rotation, preview.scale.x, preview.scale.y)
 			var changed = preview != _obj_tool_preview_node or current_tex != _obj_tool_preview_tex
 			if changed:
 				if _obj_tool_preview_node != null and is_instance_valid(_obj_tool_preview_node):
 					remove_shadow(_obj_tool_preview_node)
 				_obj_tool_preview_node = preview
 				_obj_tool_preview_tex = current_tex
+				_obj_tool_preview_rot = current_rot
 				var config = _get_placement_config()
 				remove_shadow(preview)
 				create_shadow(preview, config)
+			elif current_rot != _obj_tool_preview_rot:
+				_obj_tool_preview_rot = current_rot
+				if preview.has_meta("_shadow_config"):
+					var prot_cfg = preview.get_meta("_shadow_config")
+					if prot_cfg is Dictionary:
+						_fast_update_shadow(preview, prot_cfg)
 			# Update clip planes every frame for the preview (position changes as user moves mouse)
 			if preview.has_meta("_shadow_clip_tex") and preview.has_meta("_shadow_config"):
 				var clip_config = preview.get_meta("_shadow_config")
@@ -1830,12 +2143,17 @@ func _on_monitor_tick():
 			remove_shadow(_obj_tool_preview_node)
 		_obj_tool_preview_node = null
 		_obj_tool_preview_tex = null
+		_obj_tool_preview_rot = null
 
 	# Process nodes from OnAssignNode (ObjectTool placement)
 	_process_signal_nodes()
 	
 	# Process clone batch BEFORE UI loading (so clones have their data saved first)
 	_process_clone_batch()
+
+	# ScatterBrush mod support (brush/area modes) — must run AFTER
+	# _process_signal_nodes so native placements are already registered.
+	_check_scatterbrush_placements()
 
 	if new_monitored != null and new_monitored != _monitored_object:
 		# Track previous selection for clone detection
@@ -1897,6 +2215,17 @@ func _process_signal_nodes():
 					if rebuild_cfg.has("shadow_color") and rebuild_cfg["shadow_color"] is String:
 						rebuild_cfg["shadow_color"] = Color(rebuild_cfg["shadow_color"])
 					_deferred_create_shadow(node, rebuild_cfg)
+			continue
+		# Only a GENUINE placement made with ObjectTool/ScatterTool active should
+		# get the toggle-based shadow here. Any new node appearing while SelectTool
+		# is active (Ctrl+V, DD's own Copy/Paste buttons, duplicate, ...) is a
+		# clone, not a placement — let _process_clone_batch (right after this)
+		# decide its shadow state from the real copy source instead. Without this,
+		# a pasted/duplicated object would always get a shadow whenever the
+		# placement toggle is ON, even if the object it came from had none.
+		var active_tool = str(global.Editor.get("ActiveToolName"))
+		var is_placement_tool = active_tool in ["ObjectTool", "ScatterBrushTool", "ScatterBrush", "ScatterTool"]
+		if not is_placement_tool or _paste_pending:
 			continue
 		# Always track the node
 		_all_known_obj_ids[node_id] = node
@@ -1967,7 +2296,11 @@ func _process_clone_batch():
 			continue
 		var node_id = str(node.get_meta("node_id"))
 		
-		# For Ctrl+V paste: match by index with copy source (preserves order)
+		# For Ctrl+V paste: match by index with copy source (preserves order).
+		# A tracked paste source is authoritative — even when it has NO shadow
+		# config recorded (i.e. the copied original never had a shadow), that
+		# absence must be respected instead of falling through to the texture
+		# fallback below, which would wrongly borrow some OTHER object's shadow.
 		if is_paste and i < _copy_source_ids.size():
 			var src_id = _copy_source_ids[i]
 			if global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(src_id):
@@ -1982,35 +2315,91 @@ func _process_clone_batch():
 					_all_known_obj_ids[node_id] = node
 					_paste_just_processed = true
 					continue
+			# Tracked source exists but has no shadow data at all -> definitively "no shadow".
+			_all_known_obj_ids[node_id] = node
+			_paste_just_processed = true
+			continue
 		
-		# Fallback: match by sprite texture against ALL existing shadow configs.
-		# Covers DD Copy+Paste buttons, duplicate, etc. — any clone scenario
-		# where the new node shares the same texture as a shadowed original.
-		# Safe because fresh ObjectTool placements are caught by _process_signal_nodes
-		# before reaching here.
-		if global.ModMapData.has(SHADOW_DATA_KEY):
-			var spr = get_sprite(node)
-			if spr != null and spr.texture != null:
-				var tex_path = spr.texture.resource_path
-				if tex_path != "":
-					var matched_config = _find_shadow_config_by_texture(tex_path, node_id)
-					if matched_config != null:
-						var clone_config = matched_config.duplicate()
-						if clone_config.has("shadow_color") and clone_config["shadow_color"] is String:
-							clone_config["shadow_color"] = Color(clone_config["shadow_color"])
-						save_shadow_data(node, clone_config)
-						if clone_config.get("enabled", false):
-							_deferred_create_shadow(node, clone_config)
-						_all_known_obj_ids[node_id] = node
-						_paste_just_processed = true
-						continue
+		# Fallback by texture match DISABLED: it borrowed shadow config from any
+		# OTHER object sharing the same texture, regardless of whether the actual
+		# copied source had a shadow. Covers DD's own Copy/Paste toolbar buttons
+		# (which we have no reliable way to track the true source for) — pasting
+		# via those buttons now never inherits a shadow; re-apply it manually if
+		# needed. Ctrl+C/V above remains fully accurate since it tracks the real source.
 		
-		# Not a paste and no texture match — this is a duplicate/level-clone of an
-		# object that had no shadow, or an otherwise-unknown node. Do NOT apply the
-		# ObjectTool placement toggle here: a clone is not a placement. Genuine
-		# ObjectTool placements are handled by _process_signal_nodes (which honors
-		# the toggle). Just register it so it isn't re-processed.
+		# Not a paste (or unmatched) — duplicate/level-clone/unknown node. Do NOT
+		# apply the ObjectTool placement toggle here: a clone is not a placement.
+		# Genuine ObjectTool placements are handled by _process_signal_nodes (which
+		# honors the toggle), and ScatterBrush mod placements by
+		# _check_scatterbrush_placements. Just register it so it isn't re-processed.
 		_all_known_obj_ids[node_id] = node
+
+func _check_scatterbrush_placements():
+	"""ScatterBrush mod support. Its brush/area modes create objects through
+	Objects.CreateObject() + Prop.Load() with a manually written node_id, and
+	DD's Prop.Load calls AssignSpecificNodeID for those — which never emits
+	OnAssignNode. Those objects are also never selected, so the SelectTool
+	clone scan misses them too.
+
+	Detection strategy: World.nextNodeID is used ONLY as a dirty flag
+	("something was created this tick"). Actual discovery scans the level's
+	Objects children for props absent from _all_known_obj_ids. We never trust
+	ID ranges: ScatterBrush's raw-int node_id writing collides with DD's hex
+	node_id format, DD silently reissues IDs on collision, and a
+	[old, new) nextNodeID range can then resolve to unrelated OLD map nodes.
+
+	A baseline register-only pass runs when ScatterTool becomes active (or the
+	current level changes while it is active): _all_known_obj_ids is not
+	populated at map load, so without it the first stroke would shadow the
+	whole map. Baseline nodes get no shadow; only the delta after it does."""
+	var active_tool = str(global.Editor.get("ActiveToolName"))
+	var is_scatter = (active_tool == "ScatterTool") and _native_detect_ready
+	var level = global.World.GetCurrentLevel()
+	if not is_scatter:
+		_scatter_tool_was_active = false
+		_last_next_node_id = int(global.World.nextNodeID)
+		return
+	# Baseline pass: register everything currently on the level, no shadows.
+	if not _scatter_tool_was_active or level != _scatter_baseline_level:
+		_scatter_tool_was_active = true
+		_scatter_baseline_level = level
+		_last_next_node_id = int(global.World.nextNodeID)
+		_scan_objects_for_unknown(level, false)
+		return
+	# Delta pass: only when the ID counter moved (cheap dirty check).
+	var next_id = int(global.World.nextNodeID)
+	if next_id == _last_next_node_id:
+		return
+	_last_next_node_id = next_id
+	_scan_objects_for_unknown(level, ui_config.get("obj_tool_shadow_enabled", false))
+
+func _scan_objects_for_unknown(level, apply_shadow: bool):
+	"""Register every unknown, non-preview prop under the level's Objects
+	container. When apply_shadow is true, also give it the placement shadow
+	(unless saved shadow data already exists for its node_id)."""
+	if level == null or level.get("Objects") == null:
+		return
+	var new_config = null
+	for node in level.Objects.get_children():
+		if node == null or not is_instance_valid(node):
+			continue
+		if not node.has_meta("node_id"):
+			continue
+		if node.has_meta("preview") and node.get_meta("preview"):
+			continue
+		var node_id = str(node.get_meta("node_id"))
+		if _all_known_obj_ids.has(node_id):
+			continue
+		_all_known_obj_ids[node_id] = node
+		if not apply_shadow:
+			continue
+		if global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(node_id):
+			continue
+		if new_config == null:
+			new_config = _get_placement_config()
+		var cfg = new_config.duplicate()
+		save_shadow_data(node, cfg)
+		_deferred_create_shadow(node, cfg)
 
 func _find_shadow_config_by_texture(tex_path: String, exclude_id: String):
 	"""Find an existing shadow config for a node that shares the given texture path."""
@@ -2080,6 +2469,33 @@ func _update_all_shadow_rotations():
 		var offset = obj.get_meta("_shadow_offset") as Vector2
 		var local_offset = _world_to_local_offset(obj, offset)
 
+		# Rotation/mirror change detection. Acting here directly (frame_pre_draw
+		# callback) proved unsafe: swapping texture/material mid-callback drew one
+		# frame with the shader running on the still-bound baked texture (full dark
+		# quad). Defer the actual work to normal idle context instead.
+		# - Projected: quad extents (vertex_scale_xy) were computed for the local
+		#   light dir at creation; a rotation changes it and the stale quad clips
+		#   the shadow. The deferred handler refreshes params in place.
+		# - Offset + baked: the under-asset cut hole is burned into the baked
+		#   texture and no longer sits under the rotated asset; the handler unbakes
+		#   (live shader recomputes the cut) and rebakes after the gesture.
+		var rot_sig = Vector3(obj.rotation, obj.scale.x, obj.scale.y)
+		if not obj.has_meta("_shadow_rot_sig"):
+			obj.set_meta("_shadow_rot_sig", rot_sig)
+		elif (obj.get_meta("_shadow_rot_sig") - rot_sig).length_squared() > 0.0000001:
+			obj.set_meta("_shadow_rot_sig", rot_sig)
+			call_deferred("_refresh_shadow_after_rotation", obj)
+
+		# Free Transform warp change detection (same deferred pattern). Arrays
+		# compare by value in GDScript, so this catches corner edits, warp
+		# creation AND warp removal (signature becomes null). Near-free when
+		# FT publishes no distort data at all.
+		var ft_sig = _ft_warp_signature(obj)
+		var ft_prev = obj.get_meta("_shadow_ft_sig") if obj.has_meta("_shadow_ft_sig") else null
+		if not (ft_sig == null and ft_prev == null) and ft_sig != ft_prev:
+			obj.set_meta("_shadow_ft_sig", ft_sig)
+			call_deferred("_refresh_shadow_ft_warp", obj)
+
 		# Shadow is always a child of obj — parent transform handles rotation,
 		# scale, and mirror implicitly. Only position needs an explicit update
 		# in case the prop's sprite offset shifted.
@@ -2132,7 +2548,11 @@ func _update_all_shadow_rotations():
 						_update_clip_planes(obj, shadow_sprite, config)
 
 	# Also sync ObjectTool preview shadow (not in _all_known_obj_ids).
-	# Same simple logic as placed objects: shadow is a child, position only.
+	# Same simple logic as placed objects: shadow is a child, position only —
+	# plus the same per-frame proj_dir re-derivation as placed objects. DD rotates
+	# the ghost in its own _process AFTER our monitor tick, so refreshing proj_dir
+	# only at the tick drew the shadow rotated for one frame (visible flicker);
+	# this pre-draw callback runs after all processing, right before the draw.
 	if _obj_tool_preview_node != null and is_instance_valid(_obj_tool_preview_node):
 		var preview = _obj_tool_preview_node
 		if preview.has_meta(SHADOW_META_KEY) and preview.has_meta("_shadow_offset"):
@@ -2144,6 +2564,40 @@ func _update_all_shadow_rotations():
 					for snode in pnodes:
 						if is_instance_valid(snode):
 							snode.global_position = p_sprite.global_position + p_offset
+					if preview.has_meta("_shadow_config"):
+						var pv_cfg = preview.get_meta("_shadow_config")
+						if pv_cfg is Dictionary and pv_cfg.get("shadow_mode", "offset") == "projected":
+							var pv_ang = pv_cfg.get("proj_angle", 0.0)
+							var pv_ldir = preview.global_transform.affine_inverse().basis_xform(Vector2(cos(pv_ang), sin(pv_ang)))
+							pv_ldir = pv_ldir.normalized() if pv_ldir.length() > 0.0001 else Vector2(0.0, 1.0)
+							for snode in pnodes:
+								if is_instance_valid(snode) and snode.material is ShaderMaterial:
+									snode.material.set_shader_param("proj_dir", pv_ldir)
+
+func _refresh_shadow_after_rotation(obj) -> void:
+	# Deferred from the pre-draw rotation scan — runs in normal idle context, the
+	# same context as UI-driven updates (no one-frame texture/material mismatch).
+	if obj == null or not is_instance_valid(obj):
+		return
+	if not obj.has_meta(SHADOW_META_KEY) or not obj.has_meta("_shadow_config"):
+		return
+	var cfg = obj.get_meta("_shadow_config")
+	if not (cfg is Dictionary):
+		return
+	if cfg.get("shadow_mode", "offset") == "projected":
+		# Refresh every shader param in place: vertex_scale_xy + custom rects for
+		# the new local light direction (fixes the shadow being clipped by the
+		# stale quad on some angles), proj_dir, cut, etc. No node churn.
+		_fast_update_shadow(obj, cfg)
+	elif _baker_script != null and _baker_script.is_baked(obj, SHADOW_META_KEY):
+		# Offset + baked: unbake so the live shader recomputes the under-asset
+		# cut at the new orientation; rebake once the gesture ends (AUTO only).
+		if _should_auto_bake() and _bake_debounce != null:
+			_bake_debounce.schedule_bake(obj)  # unbakes immediately + debounced rebake
+		else:
+			var src = get_sprite(obj)
+			if src != null:
+				_baker_script.unbake(obj, SHADOW_META_KEY, src)
 
 func on_selection_changed():
 	_monitored_object = null
@@ -2153,7 +2607,15 @@ func on_selection_changed():
 		if is_shadow_node_type(node):
 			_reparent_ui_to_node(node)
 			_monitored_object = node
+			# Block apply_shadow_to_selected while the panel loads this object's
+			# config. Some load helpers momentarily reset _syncing_ui, which lets
+			# proj spin handlers leak an apply mid-load; without this guard that
+			# apply overwrites OTHER selected objects (e.g. a projected asset's
+			# proj_length) with the partially-loaded UI state. The monitor tick
+			# already guards its own load the same way.
+			_loading_ui = true
 			load_shadow_ui_from_object(node)
+			_loading_ui = false
 			return
 
 	# No valid object selected — hide UI
@@ -2542,7 +3004,7 @@ func build_select_tool_ui():
 	var pdist_spin = SpinBox.new()
 	pdist_spin.min_value = 0.0
 	pdist_spin.max_value = PROJ_MAX_LENGTH
-	pdist_spin.step = 0.05
+	pdist_spin.step = 0.01
 	pdist_spin.value = 0.0
 	pdist_spin.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	pdist_spin.rect_min_size.x = 72
@@ -2869,10 +3331,24 @@ var _scatter_tool_toggle: CheckButton = null
 var _obj_tool_lock_btn: Button = null
 var _scatter_tool_lock_btn: Button = null
 var _obj_tool_use_defaults: bool = true  # true = lock (use defaults), false = unlock (use custom)
+# --- Placement settings (cog panel on the Object/Scatter tool rows) ---
+# Opacity & Blur applied to new placements AND to the live preview. Session
+# state, shared by both tools; re-synced from the active base config (factory
+# or custom defaults) whenever the lock is toggled.
+var _place_opacity: float = FACTORY_DEFAULTS["opacity"]
+var _place_blur: float = FACTORY_DEFAULTS["blur"]
+var _place_ctrls = {"opacity": [], "blur": []}  # [slider, spin] pairs, both panels
+var _place_syncing: bool = false
+var _obj_tool_settings: VBoxContainer = null
+var _scatter_tool_settings: VBoxContainer = null
 var _obj_tool_insert_parent = null
 var _obj_tool_insert_idx = -1
 var _obj_tool_preview_node = null
 var _obj_tool_preview_tex = null  # track texture to detect asset change
+# Track the preview's rotation/mirror so the shadow is rebuilt when the user
+# rotates the ghost. Without this, a projected shadow keeps the proj_dir derived
+# at creation time and spins WITH the asset instead of following the world angle.
+var _obj_tool_preview_rot = null  # Vector3(rotation, scale.x, scale.y)
 
 func _find_shadow_checkbox(node, path):
 	"""Recursively find the native 'Shadow' CheckButton in ObjectTool."""
@@ -2940,6 +3416,11 @@ func build_object_tool_ui():
 	ot_container.add_child(ot_lock)
 	_obj_tool_lock_btn = ot_lock
 
+	var ot_cog = _make_icon_button("icons/cog.png", "Show/hide placement settings", 0.55)
+	ot_cog.toggle_mode = true
+	ot_cog.connect("toggled", self, "_on_obj_tool_cog_toggled")
+	ot_container.add_child(ot_cog)
+
 	var toggle = CheckButton.new()
 	toggle.pressed = false
 	toggle.connect("toggled", self, "_on_obj_tool_toggle")
@@ -2947,6 +3428,9 @@ func build_object_tool_ui():
 	_obj_tool_toggle = toggle
 	
 	ot_wrapper.add_child(ot_container)
+
+	_obj_tool_settings = _build_place_settings_panel()
+	ot_wrapper.add_child(_obj_tool_settings)
 	
 	var ot_sep_bottom = HSeparator.new()
 	ot_sep_bottom.add_constant_override("separation", 4)
@@ -3012,6 +3496,11 @@ func build_scatter_tool_ui():
 	st_container.add_child(st_lock)
 	_scatter_tool_lock_btn = st_lock
 
+	var st_cog = _make_icon_button("icons/cog.png", "Show/hide placement settings", 0.55)
+	st_cog.toggle_mode = true
+	st_cog.connect("toggled", self, "_on_scatter_tool_cog_toggled")
+	st_container.add_child(st_cog)
+
 	var st_toggle = CheckButton.new()
 	st_toggle.pressed = false
 	st_toggle.connect("toggled", self, "_on_obj_tool_toggle")
@@ -3019,6 +3508,9 @@ func build_scatter_tool_ui():
 	_scatter_tool_toggle = st_toggle
 	
 	st_wrapper.add_child(st_container)
+
+	_scatter_tool_settings = _build_place_settings_panel()
+	st_wrapper.add_child(_scatter_tool_settings)
 	
 	var st_sep_bottom = HSeparator.new()
 	st_sep_bottom.add_constant_override("separation", 4)
@@ -3050,26 +3542,117 @@ func _on_obj_tool_toggle(pressed: bool):
 		_obj_tool_preview_node = null
 	_update_lock_btn_visibility()
 
+# Small settings panel under the tool row (hidden until the cog is pressed):
+# Opacity and Blur for new placements. Both tools share the same values; the
+# controls of both panels are registered in _place_ctrls and kept in sync.
+func _build_place_settings_panel() -> VBoxContainer:
+	var vb = VBoxContainer.new()
+	vb.visible = false
+	for row_def in [["Opacity", "opacity", 0.05, 1.0, 0.05], ["Blur", "blur", 0.0, 1.0, 0.01]]:
+		var hbox = HBoxContainer.new()
+		hbox.add_constant_override("separation", 6)
+		var lbl = Label.new()
+		lbl.text = row_def[0]
+		lbl.rect_min_size.x = 60
+		hbox.add_child(lbl)
+		var slider = HSlider.new()
+		slider.min_value = row_def[2]
+		slider.max_value = row_def[3]
+		slider.step = row_def[4]
+		slider.value = _place_opacity if row_def[1] == "opacity" else _place_blur
+		slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		slider.connect("value_changed", self, "_on_place_value_changed", [row_def[1]])
+		hbox.add_child(slider)
+		var spin = SpinBox.new()
+		spin.min_value = row_def[2]
+		spin.max_value = row_def[3]
+		spin.step = row_def[4]
+		spin.value = slider.value
+		spin.connect("value_changed", self, "_on_place_value_changed", [row_def[1]])
+		hbox.add_child(spin)
+		var reset = _make_icon_button("icons/reset.png", "Reset " + row_def[0].to_lower(), 0.5)
+		reset.connect("pressed", self, "_on_place_single_reset", [row_def[1]])
+		hbox.add_child(reset)
+		_place_ctrls[row_def[1]].append([slider, spin])
+		vb.add_child(hbox)
+	return vb
+
+
+func _on_obj_tool_cog_toggled(pressed):
+	if _obj_tool_settings != null and is_instance_valid(_obj_tool_settings):
+		_obj_tool_settings.visible = pressed
+
+
+func _on_scatter_tool_cog_toggled(pressed):
+	if _scatter_tool_settings != null and is_instance_valid(_scatter_tool_settings):
+		_scatter_tool_settings.visible = pressed
+
+
+# One handler for both rows and both control kinds; mirrors every registered
+# control, then refreshes the live preview so the change is visible before
+# the asset is placed.
+func _on_place_value_changed(value, which):
+	if _place_syncing:
+		return
+	_set_place_value(which, float(value))
+	_refresh_obj_tool_preview()
+
+
+# Reset one row to the active base config value (factory when locked,
+# custom defaults when unlocked) and refresh the live preview.
+func _on_place_single_reset(which):
+	var base = FACTORY_DEFAULTS if _obj_tool_use_defaults else DEFAULT_SHADOW_CONFIG
+	_set_place_value(which, float(base.get(which, FACTORY_DEFAULTS[which])))
+	_refresh_obj_tool_preview()
+
+
+func _set_place_value(which: String, value: float):
+	if which == "opacity":
+		_place_opacity = value
+	else:
+		_place_blur = value
+	_place_syncing = true
+	for pair in _place_ctrls.get(which, []):
+		for ctrl in pair:
+			if ctrl != null and is_instance_valid(ctrl):
+				ctrl.value = value
+	_place_syncing = false
+
+
+# Drop the tracked preview so the next tick recreates its shadow with the
+# current placement config (same pattern as the lock button).
+func _refresh_obj_tool_preview():
+	if _obj_tool_preview_node != null and is_instance_valid(_obj_tool_preview_node):
+		remove_shadow(_obj_tool_preview_node)
+	_obj_tool_preview_node = null
+	_obj_tool_preview_tex = null
+	_obj_tool_preview_rot = null
+
+
 func _get_placement_config() -> Dictionary:
 	"""Get the config to use for new object placement.
 	   Lock = factory defaults, Unlock = custom defaults (set via 'Use as Default')."""
-	if _obj_tool_use_defaults:
-		var config = FACTORY_DEFAULTS.duplicate()
-		config["enabled"] = true
-		return config
-	else:
-		var config = DEFAULT_SHADOW_CONFIG.duplicate()
-		config["enabled"] = true
-		return config
+	var config = FACTORY_DEFAULTS.duplicate() if _obj_tool_use_defaults else DEFAULT_SHADOW_CONFIG.duplicate()
+	config["enabled"] = true
+	# Cog panel overrides (live preview follows them too).
+	config["opacity"] = _place_opacity
+	config["blur"] = _place_blur
+	return config
 
 func _on_lock_btn_pressed():
 	_obj_tool_use_defaults = !_obj_tool_use_defaults
 	_update_lock_btn_icon()
+	# The cog sliders track the active base config: re-seed them from it.
+	var base = FACTORY_DEFAULTS if _obj_tool_use_defaults else DEFAULT_SHADOW_CONFIG
+	_set_place_value("opacity", float(base.get("opacity", FACTORY_DEFAULTS["opacity"])))
+	_set_place_value("blur", float(base.get("blur", FACTORY_DEFAULTS["blur"])))
 	# Force preview recreation with new config
 	if _obj_tool_preview_node != null and is_instance_valid(_obj_tool_preview_node):
 		remove_shadow(_obj_tool_preview_node)
 	_obj_tool_preview_node = null
 	_obj_tool_preview_tex = null
+	_obj_tool_preview_rot = null
 
 func _update_lock_btn_icon():
 	var icon_path = "icons/lock.png" if _obj_tool_use_defaults else "icons/unlock.png"
@@ -3160,26 +3743,31 @@ func _on_setting_changed(pressed):
 	if pressed:
 		ui_config["settings_toggle"].pressed = true
 		ui_config["settings_panel"].visible = true
-		call_deferred("_scroll_to_bottom")
+		call_deferred("_scroll_to_section")
 	apply_shadow_to_selected(true)  # force_all: toggle applies to entire selection
 
-func _scroll_to_bottom():
-	# Find the ScrollContainer ancestor and scroll to bottom
-	# Use a short timer to let layout complete first
+func _scroll_to_section():
+	# Scroll the ancestor ScrollContainer so OUR section is visible. The
+	# section used to sit at the very bottom of the panel, so this simply
+	# scrolled to max — wrong now that it sits just above the CMT block,
+	# mid-list. Rules: if the section is taller than the viewport (cog open),
+	# align its title row to the top of the view; otherwise scroll the minimum
+	# amount (up OR down) that brings the whole section into view.
+	# Use a short timer to let layout complete first.
 	var node = ui_config.get("container")
 	if node == null:
 		return
 	var timer = Timer.new()
 	timer.wait_time = 0.05
 	timer.one_shot = true
-	timer.connect("timeout", self, "_do_scroll_to_bottom", [timer])
+	timer.connect("timeout", self, "_do_scroll_to_section", [timer])
 	global.Editor.add_child(timer)
 	timer.start()
 
-func _do_scroll_to_bottom(timer: Timer):
+func _do_scroll_to_section(timer: Timer, second_pass: bool = false):
 	timer.queue_free()
 	var node = ui_config.get("container")
-	if node == null:
+	if node == null or not is_instance_valid(node) or node.get_parent() == null:
 		return
 	var scroll = null
 	var parent = node.get_parent()
@@ -3188,14 +3776,47 @@ func _do_scroll_to_bottom(timer: Timer):
 			scroll = parent
 			break
 		parent = parent.get_parent()
-	if scroll != null:
-		scroll.scroll_vertical = int(scroll.get_v_scrollbar().max_value)
+	if scroll == null:
+		return
+	# rect_global_position is in SCREEN px (affected by any global UI scale —
+	# Enlarge UI / ui_rescaler) while scroll_vertical is in CONTENT px: divide
+	# the measured delta by the global scale or we overshoot on scaled UIs.
+	var gs = scroll.get_global_transform().get_scale().y
+	if gs <= 0.0:
+		gs = 1.0
+	var top = node.rect_global_position.y
+	var bottom = top + node.rect_size.y * gs
+	var view_top = scroll.rect_global_position.y
+	var view_bottom = view_top + scroll.rect_size.y * gs
+	var delta_screen = 0.0
+	if node.rect_size.y >= scroll.rect_size.y or top < view_top:
+		# Taller than the view, or currently above it: align title to the top.
+		delta_screen = (top - view_top) - 4.0 * gs
+	elif bottom > view_bottom:
+		# Fully fits but extends below: scroll down just enough.
+		delta_screen = (bottom - view_bottom) + 8.0 * gs
+	var delta = int(round(delta_screen / gs))
+	if delta != 0:
+		scroll.scroll_vertical += delta
+	# The settings panel may still be mid-layout at the first measurement (the
+	# enable path shows it, then creates the shadow, and the selection reload
+	# can show/hide mode-specific rows) — run ONE corrective pass a bit later.
+	# Delta-based and idempotent: it applies 0 when nothing moved.
+	if not second_pass:
+		var t2 = Timer.new()
+		t2.wait_time = 0.12
+		t2.one_shot = true
+		t2.connect("timeout", self, "_do_scroll_to_section", [t2, true])
+		global.Editor.add_child(t2)
+		t2.start()
 
 func _on_settings_toggled(pressed):
 	ui_config["settings_panel"].visible = pressed
-	if pressed:
-		# Scroll to bottom of the panel so our section is visible
-		call_deferred("_scroll_to_bottom")
+	# Guard the sync flags (parity with the Walls/Paths mods): only scroll on a
+	# USER click, never when a selection load re-syncs the toggle state.
+	if pressed and not _syncing_ui and not _loading_ui:
+		# Scroll so our section is visible (title-aligned when taller than view)
+		call_deferred("_scroll_to_section")
 
 func _on_slider_changed(value, which):
 	if _syncing_ui:
@@ -3609,7 +4230,7 @@ func _update_proj_dial_from_mouse(pos: Vector2, dial: Control):
 		if delta.length() > radius:
 			delta = delta.normalized() * radius
 		var frac = delta.length() / radius
-		var length = frac * frac * PROJ_MAX_LENGTH
+		var length = _proj_len_from_frac(frac)
 		var snap = dial.get_meta("snap_angle") as float
 		if snap >= 0.0:
 			# A snap button is active: the angle is locked, drag changes distance only.
@@ -3617,7 +4238,8 @@ func _update_proj_dial_from_mouse(pos: Vector2, dial: Control):
 			_syncing_ui = true
 			ui_config["proj_dist_spin"].value = length
 			_syncing_ui = false
-			var f2 = sqrt(length / PROJ_MAX_LENGTH) if PROJ_MAX_LENGTH > 0.0 else 0.0
+			_proj_dist_prev = ui_config["proj_dist_spin"].value
+			var f2 = _proj_frac_from_len(length)
 			var sr = deg2rad(snap)
 			_set_proj_dial_handle(dial, Vector2(cos(sr), sin(sr)) * f2)
 			apply_shadow_to_selected(false, ["proj_length"])
@@ -3627,6 +4249,7 @@ func _update_proj_dial_from_mouse(pos: Vector2, dial: Control):
 		_set_proj_dial_handle(dial, hv)
 		_syncing_ui = true
 		ui_config["proj_dist_spin"].value = length
+		_proj_dist_prev = ui_config["proj_dist_spin"].value
 		if has_dir:
 			var sun_ang = rad2deg(atan2(delta.y, delta.x))
 			if sun_ang < 0.0:
@@ -3687,15 +4310,55 @@ func _on_proj_fade_reset():
 func _apply_proj_from_spins() -> void:
 	var length = clamp(ui_config["proj_dist_spin"].value, 0.0, PROJ_MAX_LENGTH)
 	var sun_ang = ui_config["proj_sun_angle_spin"].value
-	var frac = sqrt(length / PROJ_MAX_LENGTH) if PROJ_MAX_LENGTH > 0.0 else 0.0
+	var frac = _proj_frac_from_len(length)
 	var lr = deg2rad(sun_ang)
 	if ui_config.has("proj_dir_dial"):
 		_set_proj_dial_handle(ui_config["proj_dir_dial"], Vector2(cos(lr), sin(lr)) * frac)
 	apply_shadow_to_selected(false, ["proj_angle", "proj_length"])
 
+func _proj_len_from_frac(frac: float) -> float:
+	# Dial radius fraction (0..1) -> projection length, non-linear (see PROJ_DIAL_EXP).
+	return pow(clamp(frac, 0.0, 1.0), PROJ_DIAL_EXP) * PROJ_MAX_LENGTH
+
+func _proj_frac_from_len(length: float) -> float:
+	# Inverse of _proj_len_from_frac: projection length -> dial radius fraction (0..1).
+	if PROJ_MAX_LENGTH <= 0.0:
+		return 0.0
+	return pow(clamp(length / PROJ_MAX_LENGTH, 0.0, 1.0), 1.0 / PROJ_DIAL_EXP)
+
+func _proj_ladder_up(v: float) -> float:
+	# Smallest ladder value strictly above v (clamps to the max length).
+	for step_val in PROJ_DIST_LADDER:
+		if step_val > v + 0.0001:
+			return step_val
+	return PROJ_MAX_LENGTH
+
+func _proj_ladder_down(v: float) -> float:
+	# Largest ladder value strictly below v (clamps to 0).
+	var result = 0.0
+	for step_val in PROJ_DIST_LADDER:
+		if step_val < v - 0.0001:
+			result = step_val
+		else:
+			break
+	return result
+
 func _on_proj_dist_changed(_v = null):
 	if _syncing_ui:
 		return
+	var spin = ui_config["proj_dist_spin"]
+	var cur = spin.value
+	var delta = cur - _proj_dist_prev
+	# A SpinBox arrow click moves the value by exactly ±step. Detect that and
+	# remap onto the non-uniform ladder (fine near 0, coarser further out).
+	# Typed values (any other delta) pass through unchanged.
+	if abs(abs(delta) - spin.step) < 0.0001:
+		var target = _proj_ladder_up(_proj_dist_prev) if delta > 0.0 else _proj_ladder_down(_proj_dist_prev)
+		_syncing_ui = true
+		spin.value = target
+		_syncing_ui = false
+		cur = spin.value
+	_proj_dist_prev = cur
 	_apply_proj_from_spins()
 
 func _on_proj_angle_changed(_v = null):
@@ -3715,6 +4378,7 @@ func _on_proj_dist_reset():
 	_syncing_ui = true
 	ui_config["proj_dist_spin"].value = 0.0
 	_syncing_ui = false
+	_proj_dist_prev = 0.0
 	_apply_proj_from_spins()
 
 func _on_proj_angle_reset():
@@ -4824,6 +5488,7 @@ func _apply_proj_ui_from_config(cfg: Dictionary) -> void:
 	var plen = clamp(cfg.get("proj_length", 0.0), 0.0, PROJ_MAX_LENGTH)
 	if ui_config.has("proj_dist_spin"):
 		ui_config["proj_dist_spin"].value = plen
+		_proj_dist_prev = plen
 	var ptap = cfg.get("proj_taper", 0.0)
 	if ui_config.has("proj_taper_slider"):
 		ui_config["proj_taper_slider"].value = ptap
@@ -4841,7 +5506,7 @@ func _apply_proj_ui_from_config(cfg: Dictionary) -> void:
 		ui_config["proj_sun_angle_spin"].value = round(sun_deg)
 	_deactivate_all_proj_snaps()
 	if ui_config.has("proj_dir_dial"):
-		var frac2 = sqrt(plen / PROJ_MAX_LENGTH) if PROJ_MAX_LENGTH > 0.0 else 0.0
+		var frac2 = _proj_frac_from_len(plen)
 		var lr = deg2rad(sun_deg)
 		_set_proj_dial_handle(ui_config["proj_dir_dial"], Vector2(cos(lr), sin(lr)) * frac2)
 
@@ -5022,6 +5687,39 @@ func apply_shadow_to_selected(force_all: bool = false, changed_keys: Array = [])
 ##
 #########################################################################################################
 
+func _position_container_above_cmt(vbox, container) -> void:
+	# Place the Soft Shadow section right ABOVE the "Colour and Modify Things"
+	# block in the Select Tool options. CMT has no named container: it inserts
+	# loose rows at the index of DD's own COLOR/STYLE label, and the TOPMOST of
+	# those rows is the HBox whose first child is the "Tint Color" Label — so
+	# that row is our anchor. When CMT isn't installed (or hasn't built its UI
+	# for this panel yet), do nothing and keep the current placement; this runs
+	# on every selection, so the position heals as soon as the row exists.
+	if vbox == null or container == null or container.get_parent() != vbox:
+		return
+	var target_idx = -1
+	for child in vbox.get_children():
+		# Prefer the Overlay Shadow container as anchor (it positions ITSELF
+		# above CMT) so the final order is Soft Shadow > Overlay Shadow > CMT.
+		if child.name == "OverlayShadowObjectsContainer":
+			target_idx = child.get_index()
+			break
+		if child is HBoxContainer and child.get_child_count() > 0:
+			var first = child.get_child(0)
+			if first is Label and first.text == "Tint Color":
+				target_idx = child.get_index()
+				break
+	if target_idx < 0:
+		return
+	# move_child semantics: moving DOWN shifts the anchor up by one after the
+	# removal, so the "just above the anchor" slot differs by direction.
+	var cur = container.get_index()
+	var want = target_idx if cur > target_idx else target_idx - 1
+	if cur == want or want < 0:
+		return
+	vbox.move_child(container, want)
+
+
 func _reparent_ui_to_node(node):
 	var container = ui_config.get("container")
 	if container == null:
@@ -5030,10 +5728,12 @@ func _reparent_ui_to_node(node):
 	if target_parent == null:
 		return
 	if container.get_parent() == target_parent:
+		_position_container_above_cmt(target_parent, container)
 		return
 	if container.get_parent() != null:
 		container.get_parent().remove_child(container)
 	target_parent.add_child(container)
+	_position_container_above_cmt(target_parent, container)
 
 func load_shadow_ui_from_object(obj):
 	if obj == null or not is_instance_valid(obj):
@@ -5117,6 +5817,7 @@ func load_shadow_ui_from_object(obj):
 	var plen = clamp(config.get("proj_length", 0.0), 0.0, PROJ_MAX_LENGTH)
 	if ui_config.has("proj_dist_spin"):
 		ui_config["proj_dist_spin"].value = plen
+		_proj_dist_prev = plen
 	var ptap = config.get("proj_taper", 0.0)
 	if ui_config.has("proj_taper_slider"):
 		ui_config["proj_taper_slider"].value = ptap
@@ -5138,7 +5839,7 @@ func load_shadow_ui_from_object(obj):
 	_deactivate_all_proj_snaps()
 	if ui_config.has("proj_dir_dial"):
 		# Handle points to the SUN (opposite the shadow). Radius encodes length.
-		var frac2 = sqrt(plen / PROJ_MAX_LENGTH)
+		var frac2 = _proj_frac_from_len(plen)
 		var lr = deg2rad(sun_deg)
 		_set_proj_dial_handle(ui_config["proj_dir_dial"], Vector2(cos(lr), sin(lr)) * frac2)
 	_syncing_ui = false
@@ -5159,6 +5860,23 @@ func load_shadow_ui_from_object(obj):
 ## SAVE / LOAD
 ##
 #########################################################################################################
+
+# ── External API ─────────────────────────────────────────────────────────────
+# For other mods: apply the current default soft shadow to an object they
+# just placed. The object must already carry a node_id (World.AssignNodeID).
+# Handles visuals AND per-map persistence.
+func apply_default_shadow(obj) -> void:
+	if obj == null or not is_instance_valid(obj):
+		return
+	if not obj.has_meta("node_id"):
+		outputlog("apply_default_shadow: object has no node_id, skipping", 0)
+		return
+	var cfg = DEFAULT_SHADOW_CONFIG.duplicate(true)
+	cfg["enabled"] = true
+	remove_shadow(obj)
+	create_shadow(obj, cfg)
+	save_shadow_data(obj, cfg)
+
 
 func save_shadow_data(obj, config: Dictionary):
 	if obj == null or not is_instance_valid(obj):

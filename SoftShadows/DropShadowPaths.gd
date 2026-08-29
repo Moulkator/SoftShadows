@@ -51,6 +51,7 @@ const FACTORY_DEFAULTS = {
 	"behind_layer": false,
 	"render_mode": "simple",  # "simple" = mesh géométrique | "realistic" = silhouette texturée (mode B)
 	"realistic_blur": 0.2,  # flou du mode realistic (0 = net), 0..1 -> 0..REALISTIC_BLUR_MAX_PX
+	"simple_blur": 0.4,  # Blur-style UI for Simple mode: 0..1 -> 0..SIMPLE_BLUR_MAX_PX (absolute px)
 	# Bulge : renflement local de l'ombre par-dessus l'offset de base rigide. La zone
 	# [entry, exit] (fractions de la longueur du path) bombe d'un vecteur (bulge dial),
 	# lié par défaut à l'offset principal (délier = direction indépendante via le dial).
@@ -81,6 +82,9 @@ var DEFAULT_SHADOW_CONFIG = FACTORY_DEFAULTS.duplicate()
 # halo (un Line2D est borné par la largeur de sa texture), puis le shader étale
 # l'alpha par un noyau gaussien (2*K+1)^2.
 const REALISTIC_BLUR_MAX_PX = 180.0   # plafond du rayon de flou (world px)
+# Simple-mode Blur-style slider mapping (same convention as the realistic blur):
+# slider 0..1 -> absolute softness reach in pixels, independent of path width.
+const SIMPLE_BLUR_MAX_PX = 180.0
 const REALISTIC_MIN_BLUR_PX = 0.5     # en deçà : copie nette vectorielle (sous-pixel) ; au-dessus : bake polaire
 const REALISTIC_BLUR_FLOOR_PX = 6.0   # palier bas : tout flou > 0 vaut au moins ça (les valeurs minuscules crénelaient)
 const REALISTIC_BLUR_MARGIN_MULT = 1.4  # marge de strip / rayon de flou
@@ -503,54 +507,72 @@ const ENABLE_LOGGING = true
 var logging_level = 0
 
 # Cache for visible texture height ratios (texture resource path → ratio)
-var _visible_height_cache = {}
+var _visible_band_cache = {}
+# Slider style the panel's size values belong to (0 = Spread+Softness,
+# 1 = Blur). Loaded from the monitored config; restamped to the CURRENT
+# global style only when the user touches a size slider, so a shadow authored
+# in the other style keeps its look until then.
+var _ui_slider_style = 0
 
-func _get_visible_height_ratio(line) -> float:
+# Visible (opaque) vertical bands of the path texture, as fractions of its
+# height: [outer_v0, outer_v1, inner_v0, inner_v1].
+# - OUTER band: min/max opaque rows over all columns (bounding band; interior
+#   holes count as solid). Used by the classic Spread+Softness crop.
+# - INNER band: per column, the first/last opaque rows; inner_v0 is the MAX of
+#   the tops, inner_v1 the MIN of the bottoms — i.e. the band guaranteed to be
+#   covered by texture in every (non-empty) column, "le creux le plus profond"
+#   on each side. Used by the Blur style so the opaque core never pokes out of
+#   a dip. Fully transparent columns are holes and are ignored.
+# Unreadable or fully transparent texture = full bands [0,1,0,1]. Cached.
+func _get_visible_band(line) -> Array:
 	if line.texture == null:
-		return 1.0
+		return [0.0, 1.0, 0.0, 1.0]
 	var tex = line.texture
 	var cache_key = tex.resource_path if tex.resource_path != "" else str(tex.get_rid().get_id())
-	if _visible_height_cache.has(cache_key):
-		return _visible_height_cache[cache_key]
+	if _visible_band_cache.has(cache_key):
+		return _visible_band_cache[cache_key]
+	var res = [0.0, 1.0, 0.0, 1.0]
 	var img = tex.get_data()
-	if img == null:
-		_visible_height_cache[cache_key] = 1.0
-		return 1.0
-	img.lock()
-	var w = img.get_width()
-	var h = img.get_height()
-	if h == 0 or w == 0:
+	if img != null and img.is_compressed():
+		img.decompress()
+	if img != null and not img.is_compressed():
+		img.lock()
+		var w = img.get_width()
+		var h = img.get_height()
+		if h > 0 and w > 0:
+			var step_x = int(max(1, w / 64))
+			var outer_top = h
+			var outer_bot = -1
+			var inner_top = -1
+			var inner_bot = h
+			var x = 0
+			while x < w:
+				var col_top = -1
+				var col_bot = -1
+				for y in range(h):
+					if img.get_pixel(x, y).a > 0.01:
+						col_top = y
+						break
+				if col_top >= 0:
+					for y2 in range(h - 1, col_top - 1, -1):
+						if img.get_pixel(x, y2).a > 0.01:
+							col_bot = y2
+							break
+					outer_top = min(outer_top, col_top)
+					outer_bot = max(outer_bot, col_bot)
+					inner_top = max(inner_top, col_top)
+					inner_bot = min(inner_bot, col_bot)
+				x += step_x
+			if outer_top < h and outer_bot >= 0:
+				res = [
+					float(outer_top) / float(h),
+					float(outer_bot + 1) / float(h),
+					float(inner_top) / float(h),
+					float(inner_bot + 1) / float(h)
+				]
 		img.unlock()
-		_visible_height_cache[cache_key] = 1.0
-		return 1.0
-	var first_visible = h
-	for y in range(h):
-		var found = false
-		for x in range(0, w, max(1, w / 16)):
-			if img.get_pixel(x, y).a > 0.01:
-				found = true
-				break
-		if found:
-			first_visible = y
-			break
-	var last_visible = -1
-	for y in range(h - 1, -1, -1):
-		var found = false
-		for x in range(0, w, max(1, w / 16)):
-			if img.get_pixel(x, y).a > 0.01:
-				found = true
-				break
-		if found:
-			last_visible = y
-			break
-	img.unlock()
-	if first_visible >= h or last_visible < 0:
-		_visible_height_cache[cache_key] = 1.0
-		return 1.0
-	var visible_rows = last_visible - first_visible + 1
-	var ratio = float(visible_rows) / float(h)
-	_visible_height_cache[cache_key] = ratio
-	return ratio
+	_visible_band_cache[cache_key] = res
+	return res
 
 #########################################################################################################
 ##
@@ -1178,7 +1200,7 @@ func initialise() -> void:
 	_hook_export_dialog()
 
 	outputlog("Drop Shadow Paths initialised.", 0)
-	outputlog("[BUILD: PATHS-BTNBORDER-1]", 0)
+	outputlog("[BUILD: PATHS-BLURDEF-2]", 0)
 
 #########################################################################################################
 ##
@@ -1278,6 +1300,14 @@ func _deferred_on_new_node_added(node):
 	if has_shadow and has_overlay:
 		return
 
+	# A path freshly DRAWN with the path tool is not a duplicate, even if its
+	# geometry happens to match an existing path (same size/orientation/texture
+	# gives the same geom hash): its shadow is owned by the path-tool finalize.
+	# Only paste/duplicate/split flows should copy configs. Without this guard
+	# the source's shadow flashed on the new path for a fraction of a second.
+	if node == _pt_editing_path or node == _pt_finalized_path:
+		return
+
 	# --- Try split detection (wall/path geometry changed) ---
 	var source_id = _find_split_source(node, node_type)
 
@@ -1352,13 +1382,30 @@ func _copy_config_from_source(node, new_id: String, source_id: String, has_shado
 	if not has_shadow and global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(source_id):
 		var src_config = global.ModMapData[SHADOW_DATA_KEY][source_id]
 		var new_config = src_config.duplicate()
+		# Ownership token: if someone else (e.g. the path-tool finalize) saves
+		# its own config for this node while we're yielding, we must NOT apply
+		# the source's shadow over it (that was the visible flash).
+		var copy_token = str(OS.get_ticks_usec())
+		new_config["_copy_token"] = copy_token
 		save_shadow_data(node, new_config)
 		if new_config.get("enabled", false):
 			yield(global.Editor.get_tree().create_timer(0.05), "timeout")
-			if is_instance_valid(node):
-				remove_shadow(node)
-				create_shadow(node, new_config)
-				_all_points_hashes[new_id] = _get_points_hash(node)
+			if not is_instance_valid(node):
+				return
+			var stored = global.ModMapData.get(SHADOW_DATA_KEY, {}).get(new_id, null)
+			if stored == null or str(stored.get("_copy_token", "")) != copy_token:
+				outputlog("Copy from " + source_id + " to " + new_id + " aborted (ownership changed)", 1)
+				return
+			stored.erase("_copy_token")
+			new_config.erase("_copy_token")
+			remove_shadow(node)
+			create_shadow(node, new_config)
+			_all_points_hashes[new_id] = _get_points_hash(node)
+		else:
+			var stored_off = global.ModMapData.get(SHADOW_DATA_KEY, {}).get(new_id, null)
+			if stored_off != null:
+				stored_off.erase("_copy_token")
+			new_config.erase("_copy_token")
 		outputlog("Copied shadow config from " + source_id + " to " + new_id, 0)
 
 	# Copy overlay config from source
@@ -1732,6 +1779,13 @@ func _build_path_tool_ui():
 	pt_ui["realistic_blur_hbox"] = pt_blur_row
 	pt_settings.add_child(pt_blur_row)
 
+	# Blur (Simple mode, Blur-style UI): shown instead of Spread/Softness when
+	# the global "Simple Sliders" setting is set to Blur.
+	var pt_sblur_row = _make_pt_slider_row("Blur", "simple_blur", 0.0, 1.0, 0.01, DEFAULT_SHADOW_CONFIG.get("simple_blur", 0.4))
+	pt_sblur_row.visible = false
+	pt_ui["simple_blur_hbox"] = pt_sblur_row
+	pt_settings.add_child(pt_sblur_row)
+
 	# Extend Ends with Fade
 	var pt_ext_sep = HSeparator.new()
 	pt_ext_sep.add_constant_override("separation", 2)
@@ -1837,6 +1891,7 @@ func _get_path_tool_config(path = null) -> Dictionary:
 		var user_def = global.ModMapData[USER_DEFAULTS_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
+	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_KEY, null))
 	cfg["enabled"] = true
 	# Mode-independent opacity: the slider holds the active mode's value, the other
 	# mode's value is kept in pt_ui["opacity_inactive"] (same pattern as SelectTool).
@@ -1851,6 +1906,11 @@ func _get_path_tool_config(path = null) -> Dictionary:
 		cfg["opacity_realistic"] = _pt_op_other
 	cfg["spread"] = pt_ui["spread_spin"].value
 	cfg["softness"] = pt_ui["softness_spin"].value
+	if pt_ui.has("simple_blur_spin"):
+		cfg["simple_blur"] = pt_ui["simple_blur_spin"].value
+	# Style of the loaded/monitored config; bumped to the CURRENT style when a
+	# size slider is touched. Fresh shadows default to the current style.
+	cfg["slider_style"] = int(pt_ui.get("loaded_slider_style", 1 if _simple_blur_style_enabled() else 0))
 	cfg["direction"] = _get_pt_direction()
 	cfg["render_mode"] = _get_pt_render_mode()
 	if pt_ui.has("realistic_blur_spin"):
@@ -1915,10 +1975,13 @@ func _on_pt_render_mode_pressed(mode_index):
 # Simple mode: the opposite.
 func _update_pt_mode_visibility():
 	var _realistic = (int(pt_ui.get("mode_current", 0)) == 1)
+	var _blur_style = _simple_blur_style_enabled()
 	if pt_ui.has("spread_hbox"):
-		pt_ui["spread_hbox"].visible = not _realistic
+		pt_ui["spread_hbox"].visible = not _realistic and not _blur_style
 	if pt_ui.has("softness_hbox"):
-		pt_ui["softness_hbox"].visible = not _realistic
+		pt_ui["softness_hbox"].visible = not _realistic and not _blur_style
+	if pt_ui.has("simple_blur_hbox"):
+		pt_ui["simple_blur_hbox"].visible = not _realistic and _blur_style
 	if pt_ui.has("realistic_blur_hbox"):
 		pt_ui["realistic_blur_hbox"].visible = _realistic
 	if pt_ui.has("pt_ext_hbox"):
@@ -1929,9 +1992,17 @@ func _update_pt_mode_visibility():
 
 func _on_pt_slider_changed(value, which):
 	pt_ui[which + "_spin"].value = value
+	_pt_note_size_touch(which)
 
 func _on_pt_spin_changed(value, which):
 	pt_ui[which + "_slider"].value = value
+	_pt_note_size_touch(which)
+
+# Touching a size slider in the path tool stamps the CURRENT slider style,
+# so the monitored shadow converts to it (same rule as the Select panel).
+func _pt_note_size_touch(which):
+	if which == "spread" or which == "softness" or which == "simple_blur":
+		pt_ui["loaded_slider_style"] = 1 if _simple_blur_style_enabled() else 0
 
 func _on_pt_single_reset(which):
 	# Opacity default depends on the active render mode (simple vs realistic).
@@ -1944,6 +2015,7 @@ func _on_pt_single_reset(which):
 	var def_val = _get_effective_default_for_tool(which, USER_DEFAULTS_KEY)
 	pt_ui[which + "_slider"].value = def_val
 	pt_ui[which + "_spin"].value = def_val
+	_pt_note_size_touch(which)
 
 func _on_pt_reset_pressed():
 	_sync_pt_ui_from_defaults()
@@ -1978,6 +2050,7 @@ func _sync_pt_ui_from_defaults():
 		var user_def = global.ModMapData[USER_DEFAULTS_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
+	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_KEY, null))
 	# Mode first: set mode_current before calling the handler so no swap occurs,
 	# then set the max (2.0 in Realistic) before the value to avoid clamping.
 	var _midx = _render_mode_to_index(cfg.get("render_mode", "simple"))
@@ -1998,6 +2071,10 @@ func _sync_pt_ui_from_defaults():
 	if pt_ui.has("realistic_blur_slider"):
 		pt_ui["realistic_blur_slider"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
 		pt_ui["realistic_blur_spin"].value = cfg.get("realistic_blur", FACTORY_DEFAULTS.get("realistic_blur", 0.2))
+	if pt_ui.has("simple_blur_slider"):
+		pt_ui["simple_blur_slider"].value = cfg.get("simple_blur", FACTORY_DEFAULTS.get("simple_blur", 0.4))
+		pt_ui["simple_blur_spin"].value = cfg.get("simple_blur", FACTORY_DEFAULTS.get("simple_blur", 0.4))
+	pt_ui["loaded_slider_style"] = int(cfg.get("slider_style", 1 if _simple_blur_style_enabled() else 0))
 	_on_pt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
 	if pt_ui.has("extend_check"):
 		pt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
@@ -2204,6 +2281,7 @@ func _get_wall_tool_config() -> Dictionary:
 		var user_def = global.ModMapData[USER_DEFAULTS_WALL_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
+	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_WALL_KEY, null))
 	cfg["enabled"] = true
 	if not wt_ui.has("opacity_spin"):
 		return cfg
@@ -2255,6 +2333,8 @@ func _get_effective_default_for_tool(which: String, defaults_key: String):
 		var user_def = global.ModMapData[defaults_key]
 		if user_def.has(which):
 			return user_def[which]
+	if which == "opacity" and _simple_blur_style_enabled():
+		return BLUR_STYLE_DEFAULT_OPACITY
 	return FACTORY_DEFAULTS[which]
 
 func _on_wt_reset_pressed():
@@ -2309,6 +2389,7 @@ func _sync_wt_ui_from_defaults():
 		var user_def = global.ModMapData[USER_DEFAULTS_WALL_KEY]
 		for key in user_def.keys():
 			cfg[key] = user_def[key]
+	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_WALL_KEY, null))
 	wt_ui["opacity_slider"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
 	wt_ui["opacity_spin"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
 	wt_ui["spread_slider"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
@@ -2839,6 +2920,39 @@ func build_select_tool_ui():
 	soft_hbox.add_child(soft_reset)
 	settings_panel.add_child(soft_hbox)
 	ui_config["softness_hbox"] = soft_hbox
+
+	# -- Blur (Simple mode, Blur-style UI): [Label] [Slider] [SpinBox] [Reset] --
+	# Shown instead of Spread/Softness when the global "Simple Sliders" setting
+	# (Soft Shadows tool) is set to Blur. 0..1 -> 0..SIMPLE_BLUR_MAX_PX, absolute.
+	var sblur_hbox = HBoxContainer.new()
+	sblur_hbox.visible = false
+	var sblur_label = Label.new()
+	sblur_label.text = "Blur"
+	sblur_label.rect_min_size.x = 60
+	sblur_hbox.add_child(sblur_label)
+	var sblur_slider = HSlider.new()
+	sblur_slider.min_value = 0.0
+	sblur_slider.max_value = 1.0
+	sblur_slider.step = 0.01
+	sblur_slider.value = DEFAULT_SHADOW_CONFIG.get("simple_blur", 0.4)
+	sblur_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sblur_slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	sblur_slider.connect("value_changed", self, "_on_slider_changed", ["simple_blur"])
+	sblur_hbox.add_child(sblur_slider)
+	ui_config["simple_blur_slider"] = sblur_slider
+	var sblur_spin = SpinBox.new()
+	sblur_spin.min_value = 0.0
+	sblur_spin.max_value = 1.0
+	sblur_spin.step = 0.01
+	sblur_spin.value = DEFAULT_SHADOW_CONFIG.get("simple_blur", 0.4)
+	sblur_spin.connect("value_changed", self, "_on_spin_changed", ["simple_blur"])
+	sblur_hbox.add_child(sblur_spin)
+	ui_config["simple_blur_spin"] = sblur_spin
+	var sblur_reset = _make_icon_button("icons/reset.png", "Reset blur", 0.5)
+	sblur_reset.connect("pressed", self, "_on_single_reset", ["simple_blur"])
+	sblur_hbox.add_child(sblur_reset)
+	settings_panel.add_child(sblur_hbox)
+	ui_config["simple_blur_hbox"] = sblur_hbox
 
 	# -- Blur (mode Realistic uniquement): [Label] [Slider] [SpinBox] [Reset] --
 	# Découplé de Softness. 0 = silhouette nette, 1 = flou max (REALISTIC_BLUR_MAX_PX).
@@ -3740,8 +3854,11 @@ func build_select_tool_ui():
 	_build_overlay_ui(container)
 
 	# Insert at top so shadow section appears above other mods
+	# Insert at top by default; repositioned just above the CMT block (when
+	# present) at every selection via _position_container_above_cmt.
 	path_vbox.add_child(container)
 	path_vbox.move_child(container, 0)
+	_position_container_above_cmt(path_vbox, container)
 	ui_config["container"] = container
 
 	# Set initial radio icons
@@ -3751,6 +3868,12 @@ func build_select_tool_ui():
 	_disable_focus_recursive(container)
 
 static func _disable_focus_recursive(node: Control):
+	# SpinBox (and its internal LineEdit) must keep focus, otherwise the
+	# LineEdit can't be clicked into to type a value manually.
+	if node is SpinBox:
+		return
+	if node.get_parent() is SpinBox:
+		return
 	if node is Control:
 		node.focus_mode = Control.FOCUS_NONE
 	for child in node.get_children():
@@ -3779,6 +3902,8 @@ func _on_slider_changed(value, which):
 			ui_config["softness_spin"].value = value
 		"realistic_blur":
 			ui_config["realistic_blur_spin"].value = value
+		"simple_blur":
+			ui_config["simple_blur_spin"].value = value
 		"range":
 			ui_config["range_spin"].value = value
 			_update_offset_range(value)
@@ -3809,6 +3934,10 @@ func _on_slider_changed(value, which):
 	# Range change also scales offset values — propagate both to multi-select
 	if which == "range":
 		_last_changed_params = ["range", "offset_x", "offset_y"]
+	# Touching a size slider stamps the shadow with the CURRENT slider style.
+	if which == "spread" or which == "softness" or which == "simple_blur":
+		_ui_slider_style = 1 if _simple_blur_style_enabled() else 0
+		_last_changed_params = [which, "slider_style"]
 	apply_shadow_to_selected_paths()
 
 func _on_spin_changed(value, which):
@@ -3824,6 +3953,8 @@ func _on_spin_changed(value, which):
 			ui_config["softness_slider"].value = value
 		"realistic_blur":
 			ui_config["realistic_blur_slider"].value = value
+		"simple_blur":
+			ui_config["simple_blur_slider"].value = value
 		"range":
 			ui_config["range_slider"].value = value
 			_update_offset_range(value)
@@ -3854,6 +3985,10 @@ func _on_spin_changed(value, which):
 	# Range change also scales offset values — propagate both to multi-select
 	if which == "range":
 		_last_changed_params = ["range", "offset_x", "offset_y"]
+	# Touching a size slider stamps the shadow with the CURRENT slider style.
+	if which == "spread" or which == "softness" or which == "simple_blur":
+		_ui_slider_style = 1 if _simple_blur_style_enabled() else 0
+		_last_changed_params = [which, "slider_style"]
 	apply_shadow_to_selected_paths()
 
 # Non-linear offset dial
@@ -4266,11 +4401,16 @@ func _set_render_mode_buttons(active_index: int):
 	if ui_config.has("realistic_blur_hbox"):
 		ui_config["realistic_blur_hbox"].visible = (active_index == 1)
 	# Spread / Softness ne concernent que le mode Simple (mesh) : masqués en Realistic.
+	# En style "Blur" (setting global du Soft Shadows tool), le mode Simple affiche
+	# un slider Blur unique à la place de Spread/Softness.
 	var _simple = (active_index == 0)
+	var _blur_style = _simple_blur_style_enabled()
 	if ui_config.has("spread_hbox"):
-		ui_config["spread_hbox"].visible = _simple
+		ui_config["spread_hbox"].visible = _simple and not _blur_style
 	if ui_config.has("softness_hbox"):
-		ui_config["softness_hbox"].visible = _simple
+		ui_config["softness_hbox"].visible = _simple and not _blur_style
+	if ui_config.has("simple_blur_hbox"):
+		ui_config["simple_blur_hbox"].visible = _simple and _blur_style
 	# Opacité max doublée en Realistic (le flou atténue l'ombre -> on peut la renforcer >1).
 	if ui_config.has("opacity_slider"):
 		var omax = 1.0 if _simple else 2.0
@@ -4295,7 +4435,13 @@ func _on_reset_pressed():
 		var user_def = global.ModMapData[defaults_key]
 		for key in user_def.keys():
 			reset_config[key] = user_def[key]
+	_apply_style_factory_defaults(reset_config, global.ModMapData.get(defaults_key, null))
 	reset_config["enabled"] = ui_config["enable_check"].pressed
+	# A general reset re-authors the shadow's sizes: stamp the CURRENT slider
+	# style (unless a saved user default explicitly carries one).
+	if not reset_config.has("slider_style"):
+		reset_config["slider_style"] = 1 if _simple_blur_style_enabled() else 0
+	_ui_slider_style = int(reset_config["slider_style"])
 	# Preserve current UI display state (cog, section toggles)
 	reset_config["settings_open"] = ui_config["settings_toggle"].pressed
 
@@ -4386,6 +4532,9 @@ func _on_single_reset(which):
 		"realistic_blur":
 			ui_config["realistic_blur_spin"].value = def_val
 			ui_config["realistic_blur_slider"].value = def_val
+		"simple_blur":
+			ui_config["simple_blur_spin"].value = def_val
+			ui_config["simple_blur_slider"].value = def_val
 		"offset_x", "offset_y", "offset":
 			_deactivate_all_snaps()
 			_syncing_ui = false
@@ -4433,6 +4582,10 @@ func _on_single_reset(which):
 			ui_config["shadow_color_picker"].color = def_val
 	_syncing_ui = false
 	_last_changed_params = [which]
+	# Resetting a size slider also stamps the CURRENT slider style.
+	if which == "spread" or which == "softness" or which == "simple_blur":
+		_ui_slider_style = 1 if _simple_blur_style_enabled() else 0
+		_last_changed_params = [which, "slider_style"]
 	apply_shadow_to_selected_paths()
 
 # Returns the effective default value for a given config key,
@@ -4443,7 +4596,46 @@ func _get_effective_default(which: String):
 		var user_def = global.ModMapData[defaults_key]
 		if user_def.has(which):
 			return user_def[which]
+	if which == "opacity" and _simple_blur_style_enabled():
+		return BLUR_STYLE_DEFAULT_OPACITY
 	return FACTORY_DEFAULTS[which]
+
+func _scroll_to_section():
+	# Scroll so OUR whole section is visible. _scroll_to_show (below) only ever
+	# scrolls DOWN to reveal the bottom of a target — right when the section
+	# lived at the top of the panel, wrong now that it sits just above the CMT
+	# block, mid-list (opening the cog pushed the view to the panel bottom).
+	# Rules: if the section is taller than the viewport (cog open), align its
+	# title row to the top of the view; otherwise scroll the minimum amount
+	# (up OR down) that brings the whole section into view.
+	var node = ui_config.get("container")
+	if node == null or node.get_parent() == null:
+		return
+	var scroll_container = null
+	var walker = node
+	while walker != null:
+		if walker is ScrollContainer:
+			scroll_container = walker
+			break
+		walker = walker.get_parent()
+	if scroll_container == null:
+		return
+	# Wait for layout to update
+	yield(scroll_container.get_tree(), "idle_frame")
+	yield(scroll_container.get_tree(), "idle_frame")
+	if not is_instance_valid(node) or node.get_parent() == null:
+		return
+	var top = node.rect_global_position.y
+	var bottom = top + node.rect_size.y
+	var view_top = scroll_container.rect_global_position.y
+	var view_bottom = view_top + scroll_container.rect_size.y
+	var delta = 0
+	if node.rect_size.y >= scroll_container.rect_size.y or top < view_top:
+		delta = int(top - view_top) - 4
+	elif bottom > view_bottom:
+		delta = int(bottom - view_bottom) + 8
+	if delta != 0:
+		scroll_container.scroll_vertical += delta
 
 func _scroll_to_show(target_control: Control):
 	# Scroll the parent ScrollContainer just enough to show the bottom of target_control
@@ -4482,7 +4674,7 @@ func _on_settings_toggled(pressed):
 		if global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(node_id):
 			global.ModMapData[SHADOW_DATA_KEY][node_id]["settings_open"] = pressed
 	if pressed and not _syncing_ui:
-		_scroll_to_show(ui_config["settings_panel"])
+		_scroll_to_section()
 
 func _reparent_extend_toggle(cog_open: bool):
 	var ext_hbox = ui_config.get("ext_hbox")
@@ -4965,6 +5157,8 @@ func get_current_shadow_config() -> Dictionary:
 		"opacity": _get_ui_opacities()[0],
 		"opacity_realistic": _get_ui_opacities()[1],
 		"softness": ui_config["softness_slider"].value,
+		"simple_blur": ui_config["simple_blur_slider"].value if ui_config.has("simple_blur_slider") else DEFAULT_SHADOW_CONFIG.get("simple_blur", 0.4),
+		"slider_style": _ui_slider_style,
 		"direction": _get_selected_direction(),
 		"spread": ui_config["spread_slider"].value,
 		"offset_x": ui_config["offset_x_spin"].value,
@@ -5320,6 +5514,11 @@ func apply_shadow_to_selected_paths():
 					for dkey in user_def.keys():
 						cfg[dkey] = user_def[dkey]
 				cfg["enabled"] = ui_cfg["enabled"]
+				# Fresh shadow: authored in the saved-default style if the user
+				# defaults carry one, else in the CURRENT slider style.
+				if not cfg.has("slider_style"):
+					cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
+				_apply_style_factory_defaults(cfg, global.ModMapData.get(def_key, null))
 				if node_type == "paths" and not global.ModMapData.has(USER_DEFAULTS_KEY):
 					_apply_path_transitions(cfg, node)
 			if node_type == "walls":
@@ -6115,14 +6314,41 @@ func create_shadow(path, config: Dictionary):
 
 	var opacity = config["opacity"]
 	var direction = int(config["direction"])
-	var visible_ratio = _get_visible_height_ratio(line)
-	var half_width = (line.width * visible_ratio) / 2.0
+	# Crop to the visible (opaque) band of the path texture: transparent padding
+	# at the texture edges is excluded from the shadow footprint. Interior holes
+	# still count as solid. Always on. crop_shift_px is folded into radial_offset
+	# below (+normal = texture bottom, Line2D convention: UV.y=1 at +normal edge).
+	var crop_vband = _get_visible_band(line)
+	var crop_shift_px = ((crop_vband[0] + crop_vband[1]) * 0.5 - 0.5) * line.width
+	var half_width = (line.width * max(crop_vband[1] - crop_vband[0], 0.04)) / 2.0
 	var num_strips = 10
 
 	# Convert fraction-based settings to pixel values relative to path width
 	# This ensures the shadow scales with the path size
 	var spread_px = config["spread"] * half_width
 	var softness_px = config["softness"] * half_width
+
+	# "Simple Sliders" style, PER SHADOW: a shadow keeps rendering in the style
+	# it was last edited in (slider_style), regardless of the global setting,
+	# until a size slider is touched. Absent key = legacy classic.
+	# - Blur style (1): the opaque core reaches the INNER visible edges of the
+	#   texture (the deepest dip on each side, so it never pokes out of bumpy
+	#   silhouettes), and simple_blur (0..1) adds an ABSOLUTE fade beyond —
+	#   0..SIMPLE_BLUR_MAX_PX, like the realistic blur, regardless of width.
+	#   The stored spread value is irrelevant here.
+	# - Classic style (0, Spread + Softness): width-relative sizes.
+	if int(config.get("slider_style", 0)) == 1:
+		var inner0 = crop_vband[2]
+		var inner1 = crop_vband[3]
+		if inner1 < inner0:
+			# Degenerate inner band (dips crossing): collapse to its midpoint.
+			var inner_mid = (inner0 + inner1) * 0.5
+			inner0 = inner_mid
+			inner1 = inner_mid
+		spread_px = max((inner1 - inner0) * 0.5 * line.width, 0.0)
+		softness_px = float(config.get("simple_blur", 0.4)) * SIMPLE_BLUR_MAX_PX
+		# Recenter on the inner band instead of the outer one.
+		crop_shift_px = ((inner0 + inner1) * 0.5 - 0.5) * line.width
 
 	# Start shadow from the center of the path (offset = 0)
 	# The path texture is drawn ON TOP (show_behind_parent), so it covers
@@ -6164,6 +6390,8 @@ func create_shadow(path, config: Dictionary):
 	# Slider value is in -100..+100; multiply by 2 so the effective
 	# pixel shift covers ~twice the distance while keeping the cap small.
 	var radial_offset = float(config.get("radial_offset", 0.0)) * 2.0
+	# Recenter on the visible texture band (0 when crop is off or unneeded).
+	radial_offset += crop_shift_px
 	var side_balance = float(config.get("side_balance", 0.0))
 
 	var shadow_color = config.get("shadow_color", Color(0, 0, 0, 1))
@@ -8085,6 +8313,34 @@ func on_selection_changed():
 
 	reset_ui_to_defaults()
 
+func _position_container_above_cmt(vbox, container) -> void:
+	# Place the Soft Shadow section right ABOVE the "Colour and Modify Things"
+	# block in the Select Tool options. CMT has no named container: it inserts
+	# loose rows at the index of DD's own COLOR/STYLE label, and the TOPMOST of
+	# those rows is the HBox whose first child is the "Tint Color" Label — so
+	# that row is our anchor. When CMT isn't installed (or hasn't built its UI
+	# for this panel yet), do nothing and keep the current placement; this runs
+	# on every selection, so the position heals as soon as the row exists.
+	if vbox == null or container == null or container.get_parent() != vbox:
+		return
+	var target_idx = -1
+	for child in vbox.get_children():
+		if child is HBoxContainer and child.get_child_count() > 0:
+			var first = child.get_child(0)
+			if first is Label and first.text == "Tint Color":
+				target_idx = child.get_index()
+				break
+	if target_idx < 0:
+		return
+	# move_child semantics: moving DOWN shifts the anchor up by one after the
+	# removal, so the "just above the anchor" slot differs by direction.
+	var cur = container.get_index()
+	var want = target_idx if cur > target_idx else target_idx - 1
+	if cur == want or want < 0:
+		return
+	vbox.move_child(container, want)
+
+
 func _reparent_ui_to_node(node):
 	var container = ui_config.get("container")
 	if container == null:
@@ -8093,12 +8349,14 @@ func _reparent_ui_to_node(node):
 	if target_parent == null:
 		return
 	if container.get_parent() == target_parent:
+		_position_container_above_cmt(target_parent, container)
 		_update_transition_visibility("paths")
 		return
 	if container.get_parent() != null:
 		container.get_parent().remove_child(container)
 	target_parent.add_child(container)
 	target_parent.move_child(container, 0)
+	_position_container_above_cmt(target_parent, container)
 	_update_transition_visibility("paths")
 
 func _update_transition_visibility(node_type: String):
@@ -8180,6 +8438,7 @@ func load_shadow_ui_from_path(path):
 		var user_def = global.ModMapData[defaults_key]
 		for key in user_def.keys():
 			config[key] = user_def[key]
+	_apply_style_factory_defaults(config, global.ModMapData.get(defaults_key, null))
 
 	# Load saved per-path config if it exists
 	var node_id = str(path.get_meta("node_id"))
@@ -8267,6 +8526,12 @@ func set_ui_without_signals(config: Dictionary):
 		ui_config["realistic_blur_slider"].value = cfg_blur
 	if ui_config.has("realistic_blur_spin"):
 		ui_config["realistic_blur_spin"].value = cfg_blur
+	var cfg_sblur = config.get("simple_blur", DEFAULT_SHADOW_CONFIG.get("simple_blur", 0.4))
+	if ui_config.has("simple_blur_slider"):
+		ui_config["simple_blur_slider"].value = cfg_sblur
+	if ui_config.has("simple_blur_spin"):
+		ui_config["simple_blur_spin"].value = cfg_sblur
+	_ui_slider_style = int(config.get("slider_style", 0))
 	# Bulge
 	if ui_config.has("bulge_enabled_check"):
 		ui_config["bulge_enabled_check"].pressed = config.get("bulge_enabled", DEFAULT_SHADOW_CONFIG.get("bulge_enabled", false))
@@ -8661,9 +8926,78 @@ func _get_path_containers_for_scope(scope: int) -> Array:
 
 	return containers
 
+# Blur-style shadows have a lighter factory opacity. Classic (Spread +
+# Softness) keeps the historical factory values untouched.
+const BLUR_STYLE_DEFAULT_OPACITY = 0.4
+
+# Apply the style-dependent factory defaults onto a freshly built default
+# config (FACTORY + user defaults merge). Only fills opacity when the user
+# defaults don't explicitly provide one and the effective style is Blur.
+func _apply_style_factory_defaults(cfg: Dictionary, user_def):
+	var eff_style = int(cfg.get("slider_style", 1 if _simple_blur_style_enabled() else 0))
+	var user_has_opacity = (user_def is Dictionary) and user_def.has("opacity")
+	if eff_style == 1 and not user_has_opacity:
+		cfg["opacity"] = BLUR_STYLE_DEFAULT_OPACITY
+
+
+# Global "Simple Sliders" style, owned by LevelSettingsPatch (Soft Shadows
+# tool): false = classic Spread + Softness, true = single Blur slider.
+# Defaults to classic when unreachable.
+func _simple_blur_style_enabled() -> bool:
+	if core != null:
+		var lsp = core.get("level_settings_patch")
+		if lsp != null and lsp.has_method("is_simple_blur_style"):
+			return lsp.is_simple_blur_style()
+	return false
+
+
+# Called by LevelSettingsPatch when the "Simple Sliders" style changes:
+# swap the visible rows in the Select panel. NO rebuild — each shadow keeps
+# its authored style until one of its size sliders is touched.
+func on_simple_slider_style_changed():
+	if ui_config != null and ui_config.has("mode_btn_0"):
+		_set_render_mode_buttons(0 if ui_config["mode_btn_0"].pressed else 1)
+	if pt_ui != null and pt_ui.size() > 0:
+		_update_pt_mode_visibility()
+		# New/monitored tool shadows follow the new style immediately (their
+		# size values stay whatever the rows currently hold).
+		pt_ui["loaded_slider_style"] = 1 if _simple_blur_style_enabled() else 0
+
+# Rebuild every enabled Simple-mode shadow on the map (all levels), from saved
+# config. Called by LevelSettingsPatch when the crop setting is toggled.
+# Realistic shadows are untouched (the crop setting only affects Simple).
+func refresh_simple_shadows():
+	if not global.ModMapData.has(SHADOW_DATA_KEY):
+		return
+	var shadow_data = global.ModMapData[SHADOW_DATA_KEY]
+	var count = 0
+	for node_id in shadow_data.keys():
+		var config = shadow_data[node_id]
+		if not config.get("enabled", false):
+			continue
+		if config.get("render_mode", "simple") == "realistic":
+			continue
+		if not global.World.HasNodeID(node_id):
+			continue
+		var node = global.World.GetNodeByID(node_id)
+		if node == null or not is_instance_valid(node) or not is_shadow_node_type(node):
+			continue
+		remove_shadow(node)
+		create_shadow(node, config)
+		count += 1
+	outputlog("refresh_simple_shadows rebuilt " + str(count) + " shadows", 0)
+
 func apply_saved_shadows_to_map():
 
 	outputlog("apply_saved_shadows_to_map", 1)
+	# Map (re)load: the per-map "Simple Sliders" style is seeded by now —
+	# refresh the style-dependent tool rows (built before the style is known)
+	# and rebase the tool baselines on it. Also re-seed the tool values from
+	# the defaults: their initial values were computed before the style was
+	# known (e.g. wall opacity showed 0.6 instead of the Blur-style 0.4).
+	on_simple_slider_style_changed()
+	_sync_pt_ui_from_defaults()
+	_sync_wt_ui_from_defaults()
 
 	if global.ModMapData.has(SHADOW_DATA_KEY):
 		var shadow_data = global.ModMapData[SHADOW_DATA_KEY]
@@ -9233,16 +9567,21 @@ func _on_overlay_enable_toggled(pressed):
 func _on_overlay_slider_changed(value, param_name):
 	if _syncing_ui:
 		return
+	# Propagate the NEW value (whichever control triggered this) to its
+	# counterpart, instead of always pulling from the slider — otherwise
+	# typing/scrolling in the spinbox gets overwritten by the stale slider value.
+	_syncing_ui = true
 	if param_name == "opacity":
-		if overlay_ui.has("opacity_slider") and overlay_ui.has("opacity_spin"):
-			_syncing_ui = true
-			overlay_ui["opacity_spin"].value = overlay_ui["opacity_slider"].value
-			_syncing_ui = false
+		if overlay_ui.has("opacity_slider"):
+			overlay_ui["opacity_slider"].value = value
+		if overlay_ui.has("opacity_spin"):
+			overlay_ui["opacity_spin"].value = value
 	elif param_name == "fade":
-		if overlay_ui.has("fade_slider") and overlay_ui.has("fade_spin"):
-			_syncing_ui = true
-			overlay_ui["fade_spin"].value = overlay_ui["fade_slider"].value
-			_syncing_ui = false
+		if overlay_ui.has("fade_slider"):
+			overlay_ui["fade_slider"].value = value
+		if overlay_ui.has("fade_spin"):
+			overlay_ui["fade_spin"].value = value
+	_syncing_ui = false
 	apply_overlay_to_selected()
 
 func _on_overlay_dir_pressed(dir_idx):

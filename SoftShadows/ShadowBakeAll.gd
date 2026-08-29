@@ -33,6 +33,12 @@ var logging_level = 0
 
 const ENABLE_LOGGING = true
 
+# Temporary diagnostic: traces level identity (ID/Label/name) at bake time, at
+# record-write time and at restore time, plus compares the level _current_level()
+# returns against DD's official GetCurrentLevel()/CurrentLevelId. Set false to
+# silence once the wrong-level-on-reload issue is understood.
+const BAKE_LEVEL_DIAG := true
+
 # Bake resolution in pixels per tile. 256 == TileSize == 1:1 pixel-perfect overlay.
 # Lower it on very large maps (memory + CPU combine cost).
 var px_per_tile := 256
@@ -107,11 +113,46 @@ func outputlog(msg, level=0):
 		print(msg)
 
 
+# Compact one-liner describing a level's identity for the diagnostic logs.
+func _lvl_dbg(level) -> String:
+	if level == null:
+		return "level=<null>"
+	if not is_instance_valid(level):
+		return "level=<freed>"
+	var idv = level.get("ID")
+	var lbl = level.get("Label")
+	return "ID=%s Label=%s name=%s iid=%d visible=%s basekey=%s" % [
+		str(idv), str(lbl), String(level.name), level.get_instance_id(),
+		str(level.get("visible")), _level_base_key(level)]
+
+
+func _diag(msg) -> void:
+	if BAKE_LEVEL_DIAG:
+		printraw("(%d) <ShadowBakeAll/DIAG>: " % OS.get_ticks_msec())
+		print(msg)
+
+
+# Logs what _current_level() resolves vs DD's official current-level API, so any
+# disagreement (the suspected cause of wrong-level-on-reload) is visible.
+func _diag_current_level(world, where: String) -> void:
+	if not BAKE_LEVEL_DIAG or world == null:
+		return
+	var resolved = _current_level(world)
+	var official = null
+	if world.has_method("GetCurrentLevel"):
+		official = world.call("GetCurrentLevel")
+	var cur_id = world.get("CurrentLevelId")
+	var agree = (official != null and resolved != null and official == resolved)
+	_diag("[%s] CurrentLevelId=%s | _current_level -> %s | GetCurrentLevel -> %s | AGREE=%s" % [
+		where, str(cur_id), _lvl_dbg(resolved), _lvl_dbg(official), str(agree)])
+
+
 func initialise():
 	if dropshadow_objects == null:
 		if global != null and global.ModMapData.has("_dropshadow_refs"):
 			dropshadow_objects = global.ModMapData["_dropshadow_refs"].get("objects")
 	outputlog("ShadowBakeAll initialised (objects=%s)" % str(dropshadow_objects != null), 0)
+	outputlog("[BUILD: BAKEALL-INFO-3] BAKE_LEVEL_DIAG=%s" % str(BAKE_LEVEL_DIAG), 0)
 	var drv = OS.get_video_driver_name(OS.get_current_video_driver())
 	outputlog("Video driver: %s | GPU: %s" % [str(drv), str(VisualServer.get_video_adapter_name())], 0)
 
@@ -321,9 +362,17 @@ func build_controls(container):
 		return
 	container.add_child(HSeparator.new())
 
+	# Title row: [label] [info icon]. Clicking the icon toggles the inline
+	# explanation label just below (hidden by default to declutter the panel).
+	var title_row = HBoxContainer.new()
+	title_row.add_constant_override("separation", 6)
 	var title = Label.new()
 	title.text = "Bake All Shadows"
-	container.add_child(title)
+	title_row.add_child(title)
+	var bake_info = _make_info_toggle("Merges the chosen shadow types into one image per level — more FPS, less lag — and Unbake restores them. This differs from the per-asset Render bake, where each asset's shadow is baked individually and stays on the asset.")
+	title_row.add_child(bake_info[0])
+	container.add_child(title_row)
+	container.add_child(bake_info[1])
 
 	var scope_hb = HBoxContainer.new()
 	var scope_lbl = Label.new()
@@ -366,13 +415,44 @@ func build_controls(container):
 	container.add_child(unbake_btn)
 	_unbake_btn = unbake_btn
 
-	var help = Label.new()
-	help.autowrap = true
-	help.text = "Merges the chosen shadow types into one image per level — more FPS, less lag — and Unbake restores them. This differs from the per-asset Render bake, where each asset's shadow is baked individually and stays on the asset."
-	help.modulate = Color(1, 1, 1, 0.6)
-	container.add_child(help)
-
 	_refresh_buttons()
+
+
+# Small clickable info icon (icons/info.png): clicking toggles an inline
+# explanation label in the panel (returned alongside the button; the caller
+# places the label below the row). Falls back to a "?" button if the icon is
+# missing. Returns [icon_button, description_label].
+# (Same pattern as LevelSettingsPatch._make_info_toggle.)
+func _make_info_toggle(text: String) -> Array:
+	var lbl = Label.new()
+	lbl.text = text
+	lbl.autowrap = true
+	lbl.visible = false
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.add_color_override("font_color", Color(0.7, 0.7, 0.7, 1.0))
+	var image = Image.new()
+	image.load(global.Root + "icons/info.png")
+	var btn
+	if image.get_width() > 0 and image.get_height() > 0:
+		var tex = ImageTexture.new()
+		tex.create_from_image(image)
+		btn = TextureButton.new()
+		btn.texture_normal = tex
+		btn.expand = true
+		btn.stretch_mode = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
+		btn.rect_min_size = Vector2(18, 18)
+		btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	else:
+		btn = Button.new()
+		btn.text = "?"
+	btn.hint_tooltip = "Show/hide details."
+	btn.connect("pressed", self, "_on_info_toggle", [lbl])
+	return [btn, lbl]
+
+
+func _on_info_toggle(lbl):
+	if lbl != null and is_instance_valid(lbl):
+		lbl.visible = not lbl.visible
 
 
 func _on_cat_toggled(pressed: bool, cat: String) -> void:
@@ -501,6 +581,8 @@ func bake_current_level():
 	if level == null or viewport == null:
 		outputlog("bake: no current level / viewport, abort", 0)
 		return
+	_diag_current_level(world, "bake_current_level")
+	_diag("bake_current_level -> baking %s" % _lvl_dbg(level))
 	_busy = true
 	_refresh_buttons()
 	_progress_open("Rendering shadows…")
@@ -542,6 +624,7 @@ func bake_all_levels():
 		yield(tree, "idle_frame")
 		var lvl = _current_level(world)
 		outputlog("bake_all: index %d -> level %s" % [i, str(lvl.name) if lvl != null else "null"], 0)
+		_diag_current_level(world, "bake_all i=%d" % i)
 		if lvl != null and not _bake_records.has(lvl.get_instance_id()):
 			yield(_bake_level(world, camera, ui, viewport, lvl, float(i) / float(n), float(i + 1) / float(n)), "completed")
 	# Restore the level the user was on.
@@ -672,6 +755,7 @@ func _bake_level(world, camera, ui, viewport, level, prog_lo := 0.0, prog_hi := 
 
 	_bake_records[lid] = {"level": level, "overlay": spr, "off": off, "ppt": ppt}
 	_write_bake_record(level, off, ppt, img_b64)
+	_diag("_bake_level WROTE record for %s (off=%d)" % [_lvl_dbg(level), off.size()])
 	outputlog("bake: level %s done, %d off | timings ms: capture=%d compute=%d encode=%d remove=%d total=%d" % [str(level.name), off.size(), t_capture - t_start, t_compute - t_capture, t_encode - t_compute, t_remove - t_encode, t_remove - t_start], 0)
 	return true
 
@@ -757,6 +841,12 @@ func on_map_load():
 	var world = global.get("World")
 	var restored := 0
 	var failed := 0
+	if BAKE_LEVEL_DIAG:
+		_diag("on_map_load: record keys = %s" % str(recs.keys()))
+		var all_levels = (world.call("get_AllLevels") if world != null else null)
+		if all_levels != null:
+			for lvl in all_levels:
+				_diag("on_map_load: live level %s" % _lvl_dbg(lvl))
 	for lvl_key in recs.keys():
 		var entry = recs[lvl_key]
 		if not (entry is Dictionary):
@@ -765,6 +855,20 @@ func on_map_load():
 		var ppt = int(entry.get("ppt", 256))
 		var level = _find_level_by_record_key(world, lvl_key)
 		var img = _decode_png(entry.get("img", ""))
+		if level == null:
+			# Key didn't match any Label (ID-keyed legacy save, or same-name
+			# reordering). Recover the owning level from the stable node IDs in
+			# the off-list, then re-key the record under the new Label key.
+			level = _resolve_level_via_off(world, off)
+			if level != null:
+				var new_key = _unique_level_key(world, level)
+				if new_key != lvl_key:
+					recs.erase(lvl_key)
+					recs[new_key] = entry
+				_diag("on_map_load: key=%s unmatched -> recovered via node id, re-keyed to %s (%s)" % [
+					str(lvl_key), str(new_key), _lvl_dbg(level)])
+		_diag("on_map_load: record key=%s -> matched %s | img=%s" % [
+			str(lvl_key), _lvl_dbg(level), ("ok" if img != null else "FAILED")])
 		if level == null or img == null:
 			# Can't rebuild the overlay -> re-enable the shadows so the map isn't
 			# left blank (apply_saved_shadows_to_map will then recreate them) and
@@ -1232,29 +1336,88 @@ func _get_node_by_id(world, id: String):
 func _write_bake_record(level, off: Array, ppt: int, img_b64: String) -> void:
 	if not global.ModMapData.has(BAKE_RECORD_KEY):
 		global.ModMapData[BAKE_RECORD_KEY] = {}
-	var lvl_id = _level_record_key(level)
+	var world = global.get("World")
+	var lvl_id = _unique_level_key(world, level)
 	global.ModMapData[BAKE_RECORD_KEY][lvl_id] = {
 		"off": off,
 		"ppt": ppt,
 		"img": img_b64,
+		"label": _level_base_key(level),
 	}
 
 
 func _clear_bake_record(level) -> void:
 	if not global.ModMapData.has(BAKE_RECORD_KEY):
 		return
-	var lvl_id = _level_record_key(level)
+	var world = global.get("World")
+	var lvl_id = _unique_level_key(world, level)
 	if global.ModMapData[BAKE_RECORD_KEY].has(lvl_id):
 		global.ModMapData[BAKE_RECORD_KEY].erase(lvl_id)
 	if global.ModMapData[BAKE_RECORD_KEY].empty():
 		global.ModMapData.erase(BAKE_RECORD_KEY)
 
 
-func _level_record_key(level) -> String:
-	# Prefer a stable level ID if exposed; fall back to label/name.
-	if level.get("ID") != null:
-		return str(level.get("ID"))
+# Base record key for a level: its user-facing Label (stable across save/reload,
+# unlike Level.ID which DD reassigns on load). Falls back to ID then node name
+# only if the Label is empty.
+func _level_base_key(level) -> String:
+	if level == null or not is_instance_valid(level):
+		return ""
+	var lbl = level.get("Label")
+	if lbl != null and String(lbl) != "":
+		return String(lbl)
+	var idv = level.get("ID")
+	if idv != null:
+		return "ID:" + str(idv)
 	return String(level.name)
+
+
+# Unique record key: the base key, suffixed "#n" when several levels share the
+# same Label, n being the 0-based position among same-named levels in load order
+# (first keeps the bare Label). Computed identically at write and at match time
+# from the live level list, so it round-trips within a session.
+func _unique_level_key(world, level) -> String:
+	var base = _level_base_key(level)
+	if world == null:
+		return base
+	var levels = world.call("get_AllLevels")
+	if levels == null:
+		return base
+	var n := 0
+	for lvl in levels:
+		if lvl == null:
+			continue
+		if lvl == level:
+			break
+		if _level_base_key(lvl) == base:
+			n += 1
+	if n == 0:
+		return base
+	return "%s#%d" % [base, n]
+
+
+# Migration / robustness fallback: find a level from a record's off-list, which
+# holds STABLE node IDs (unlike Level.ID). Resolves the first valid node and
+# walks up to its owning Level. Recovers ID-keyed records from older saves and
+# survives same-name reordering.
+func _resolve_level_via_off(world, off: Array):
+	if world == null:
+		return null
+	var levels = world.call("get_AllLevels")
+	if levels == null:
+		return null
+	var lvlset := {}
+	for l in levels:
+		if l != null:
+			lvlset[l.get_instance_id()] = l
+	for item in off:
+		var node = _get_node_by_id(world, str(item.get("id", "")))
+		var p = node
+		while p != null and is_instance_valid(p):
+			if lvlset.has(p.get_instance_id()):
+				return lvlset[p.get_instance_id()]
+			p = p.get_parent()
+	return null
 
 
 # Image -> base64 PNG string (compresses transparent areas very well).
@@ -1286,7 +1449,7 @@ func _find_level_by_record_key(world, key: String):
 	if levels == null:
 		return null
 	for lvl in levels:
-		if lvl != null and _level_record_key(lvl) == key:
+		if lvl != null and _unique_level_key(world, lvl) == key:
 			return lvl
 	return null
 

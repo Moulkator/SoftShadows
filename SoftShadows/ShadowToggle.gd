@@ -29,6 +29,7 @@ const ENABLE_LOGGING = true
 var logging_level = 0
 
 const STATE_KEY = "DropShadowToggleHidden"
+const BS_PATTERN_KEY = "BuildingShadowTex"  # mirror of BuildingShadow.BS_TEX_KEY
 
 const ASSET_TYPES = ["objects", "walls", "paths", "roofs"]
 
@@ -200,7 +201,27 @@ func _apply_global_visibility():
 			continue
 		for at in ASSET_TYPES:
 			total += _apply_visibility_in_level(level, at, visible)
+	total += _apply_visibility_building_shadows(visible)
 	outputlog("Visibility=%s applied to %d shadow node(s)" % [str(visible), total], 1)
+
+
+# Building Shadow patterns (created by BuildingShadow.gd) are ordinary DD
+# pattern shapes — they are identified through the ModMapData registry the
+# module maintains ({node_id: opacity} under BS_PATTERN_KEY, mirrored const).
+func _apply_visibility_building_shadows(visible) -> int:
+	var rec = global.ModMapData.get(BS_PATTERN_KEY, null)
+	if not (rec is Dictionary):
+		return 0
+	var count = 0
+	for k in rec.keys():
+		var id = int(k)
+		if not global.World.HasNodeID(id):
+			continue
+		var n = global.World.GetNodeByID(id)
+		if n != null and is_instance_valid(n):
+			n.visible = visible
+			count += 1
+	return count
 
 
 func _apply_visibility_in_level(level, asset_type, visible) -> int:

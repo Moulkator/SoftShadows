@@ -1,5 +1,29 @@
 SOFT SHADOWS
 
+v1.6.0
+- New Building Shadow feature in the Pattern Tool
+- New Soft Clipping feature for lights
+- New Ignore Corners feature for lights
+- Fixed comically large shadows on wide paths or walls by adding a new way to draw shadows via a Blur slider instead of two sliders (Spread + Softness)
+- Ability to choose between the Blur slider and the Spread + Softness sliders at the bottom of the Soft Shadow Tool (Effects Tab). Placed shadows will remain the same until you change a setting. The new Blur mode is activated by default on new maps as it is better visually in almost all cases.
+- Improved shadow baking when loading a map (+ loading bar)
+- Added a Blur and an Opacity slider in the Objects tool and Scatter Tool
+- Changed the Max Distance from 1.5 to 4 in projected modes
+- Added smaller steps with lower distance values for a better control
+- Added an "Ignore Transparency Color" setting for Overlay Shadows on objects
+- Compatibility with all Free Transform modes from the Unofficial Patch mod (previously incompatible with skew, distort and perspective)
+- Compatibility with Scatter Brush from uchideshi34
+- Buttons have been moved up in the Selection Tool above Colour and Modify Things to be more easily accessible
+- Info icons in the Soft Shadows Tool (Effects Tab): click the (i) icon next to show/hide an inline explanation
+- Fixed a bug resetting the Projected Shadows settings when both Projected and Offset shadows were selected with a dragbox
+- Fixed a small gap between the shadow and the asset that could appear in Projected modes
+- Fixed several bugs related to asset rotation and shadow rotation
+- Fixed locked spinboxes related to Paths
+- Fixed wrongly applied shadows on copied objects (unfortunately, the UI buttons for copy can't copy object shadows for now)
+- Fixed double shadow being applied with the bake modes, creating a black undershadow visible on colored ones
+- Fixed some issues with Colour and Modify Things (from uchideshi34) and Free Transform from the Unofficial Patch
+- Fixed a shadow "flash": drawing a path with the same size, orientation and texture as an existing one briefly showed the other path's shadow on it. Freshly drawn paths are no longer mistaken for duplicates.
+
 v1.5.1
 - Renamed "Reset Defaults" to "Factory Reset" for Objects (was only for paths and walls before, objects were forgotten)
 - Fixed the default opacity sliders (walls and paths) to be 0.6 in simple mode and 1.2 in realistic mode

@@ -17,6 +17,8 @@ var SoftShadowsToolScript
 var OverlayShadowObjectsScript
 var ShadowHistoryScript
 var ShadowBakeAllScript
+var BuildingShadowScript
+var LightShadowsScript
 var dropshadow_paths
 var dropshadow_walls
 var dropshadow_objects
@@ -27,12 +29,14 @@ var soft_shadows_tool
 var overlay_shadow_objects
 var shadow_history
 var shadow_bake_all
+var building_shadow
+var light_shadows
 
 var store_last_valid_selection = []
 
 # Logging Functions
 const ENABLE_LOGGING = true
-var logging_level = 0
+var logging_level = 1
 
 #########################################################################################################
 ##
@@ -254,6 +258,30 @@ func initialise_dropshadow():
 	else:
 		outputlog("Warning: OverlayShadowObjects.gd not found, overlay shadows disabled", 0)
 
+	# ── Building Shadow (structure silhouette → shadow pattern) ─────────
+	BuildingShadowScript = ResourceLoader.load(Global.Root + "BuildingShadow.gd", "GDScript", true)
+	if BuildingShadowScript != null:
+		building_shadow = BuildingShadowScript.new()
+		building_shadow.global = Global
+		building_shadow.core = self
+		building_shadow.logging_level = logging_level
+		building_shadow.initialise()
+	else:
+		outputlog("Warning: BuildingShadow.gd not found, building shadows disabled", 0)
+
+	# ── Light Shadows (per-light shadow softness) ───────────────────────
+	LightShadowsScript = ResourceLoader.load(Global.Root + "LightShadows.gd", "GDScript", true)
+	if LightShadowsScript != null:
+		light_shadows = LightShadowsScript.new()
+		light_shadows.global = Global
+		light_shadows.core = self
+		light_shadows.logging_level = logging_level
+		light_shadows.shadow_history = shadow_history
+		light_shadows.initialise()
+		_pause_monitor(light_shadows)
+	else:
+		outputlog("Warning: LightShadows.gd not found, light shadow softness disabled", 0)
+
 
 # Pause/resume each module's _monitor_timer during the map-load critical
 # window. Without this, monitors (especially walls' aggressive "orphaned
@@ -284,6 +312,10 @@ func _resume_monitor(module):
 
 func update(_delta):
 
+	# Per-frame fast path: soft-light move detection & proxy sync
+	if light_shadows != null:
+		light_shadows.on_update()
+
 	# Detect selection changes in SelectTool
 	if Global.Editor.ActiveToolName == "SelectTool":
 		if has_selection_changed():
@@ -297,6 +329,8 @@ func update(_delta):
 				dropshadow_roofs.on_selection_changed()
 			if overlay_shadow_objects != null:
 				overlay_shadow_objects.on_selection_changed()
+			if light_shadows != null:
+				light_shadows.on_selection_changed()
 
 	# LevelSettingsPatch: polls for tool-panel readiness + tree mutations
 	if level_settings_patch != null:
@@ -305,6 +339,10 @@ func update(_delta):
 	# ShadowBakeAll: refresh bake/unbake button state when the level changes
 	if shadow_bake_all != null:
 		shadow_bake_all.on_update()
+
+	# BuildingShadow: retries UI injection + mode exclusivity polling
+	if building_shadow != null:
+		building_shadow.on_update(_delta)
 
 #########################################################################################################
 ##
@@ -353,6 +391,8 @@ func _on_map_load_timer():
 		dropshadow_roofs.apply_saved_state()
 	if overlay_shadow_objects != null:
 		overlay_shadow_objects.apply_saved_shadows_to_map()
+	if light_shadows != null:
+		light_shadows.apply_saved_shadows_to_map()
 	# Post-process: finalise STATE_KEY from preempted ids, apply global quality
 	if level_settings_patch != null:
 		level_settings_patch.apply_saved_state()
@@ -367,3 +407,4 @@ func _on_map_load_timer():
 	_resume_monitor(dropshadow_objects)
 	_resume_monitor(dropshadow_roofs)
 	_resume_monitor(overlay_shadow_objects)
+	_resume_monitor(light_shadows)
