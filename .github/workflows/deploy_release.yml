@@ -34,13 +34,17 @@ jobs:
       - name: Copy files recursively
         run: cp -r SoftShadows/. SoftShadows_${{ needs.check-version.outputs.version }}/
       - name: Zip Release
-        run: zip -r SoftShadows_${{ needs.check-version.outputs.version }}.zip SoftShadows_${{ needs.check-version.outputs.version }}
+        run: |
+          zip -r SoftShadows_${{ needs.check-version.outputs.version }}.zip SoftShadows_${{ needs.check-version.outputs.version }}
+          zip -r SoftShadows.zip SoftShadows_${{ needs.check-version.outputs.version }}
       - name: Deploy Release
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ needs.check-version.outputs.version }}
           tag_name: ${{ needs.check-version.outputs.version }}
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
-          files: SoftShadows_${{ needs.check-version.outputs.version }}.zip
+          files: |
+            SoftShadows_${{ needs.check-version.outputs.version }}.zip
+            SoftShadows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
