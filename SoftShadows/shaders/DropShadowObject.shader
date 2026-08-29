@@ -23,6 +23,15 @@ uniform vec2 sprite_world_pos = vec2(0.0);
 uniform float sprite_world_rot = 0.0;
 uniform vec2 sprite_world_scale = vec2(1.0);
 uniform vec2 obj_world_pos = vec2(0.0);
+// Quad centre in LOCAL px (before scaling). For a centred sprite this is its
+// `offset`; for a non-centred one, offset + tex_size/2. The vertex expansion is
+// anchored here instead of the local origin: the fragment UV remap assumes the
+// expansion is symmetric about the TEXTURE centre, which only holds when the
+// quad centre is the anchor. Scaling about the origin displaced the whole
+// shadow (body AND under-asset cut) by (v_scale-1)*offset for sprites with a
+// non-zero offset — the cut hole peeked out from one side of the asset, growing
+// with the projected distance (v_scale grows with proj_length).
+uniform vec2 quad_center_px = vec2(0.0);
 uniform float shadow_clip_radius = 200.0;
 uniform sampler2D poly_data_tex;
 uniform int poly_data_size = 0;
@@ -45,7 +54,7 @@ varying vec2 v_scaled_vertex;
 
 void vertex() {
     v_scale = vertex_scale_xy;
-    VERTEX *= mat2(vec2(v_scale.x, 0.0), vec2(0.0, v_scale.y));
+    VERTEX = quad_center_px + (VERTEX - quad_center_px) * vec2(v_scale.x, v_scale.y);
     v_scaled_vertex = VERTEX;
 }
 
@@ -115,6 +124,68 @@ float check_polyline(vec2 world_pos, vec4 def, int normal_start) {
     return crossings;
 }
 
+// --- Free Transform (Unofficial Patch) warp support -------------------------
+// When FT distorts/perspectives the parent asset (a bilinear corner warp done
+// in the asset's own material), the shadow must show the WARPED silhouette.
+// The blur / projection / extrude geometry stays in the un-warped quad space;
+// only the silhouette lookups are inverse-mapped through the warp, per sample.
+// Params are fed by DropShadowObjects.gd from FT's published corner data
+// (ModMapData["_ft_distort"], corners in the sprite's local px, +/-real_size/2
+// space). ft_warp_enabled = 0.0 keeps behavior identical to the previous
+// version of this shader.
+uniform float ft_warp_enabled = 0.0;
+uniform vec2 ft_corner_tl = vec2(0.0);
+uniform vec2 ft_corner_tr = vec2(0.0);
+uniform vec2 ft_corner_br = vec2(0.0);
+uniform vec2 ft_corner_bl = vec2(0.0);
+uniform vec2 ft_tex_size = vec2(1.0);   // real texture px (region size if any)
+uniform vec2 ft_center_px = vec2(0.0);  // drawn-rect centre in local px
+
+float ft_cr(vec2 a, vec2 b) { return a.x * b.y - a.y * b.x; }
+
+// p_uv: un-warped texture uv of this sample. Returns the uv of the source
+// texel visible at that spatial position under the corner warp (inverse
+// bilinear, same math as FT's distort shader), or vec2(-10.0) when the
+// position falls outside the warped quad (transparent).
+vec2 ft_warp_sample(vec2 p_uv) {
+    vec2 p = ft_center_px + (p_uv - vec2(0.5)) * ft_tex_size;
+    vec2 a = ft_corner_tl; vec2 b = ft_corner_tr; vec2 c = ft_corner_br; vec2 d = ft_corner_bl;
+    vec2 nrm_ctr = (a + b + c + d) * 0.25;
+    float nrm_s = max(max(length(b - a), length(d - a)), 1e-3);
+    a = (a - nrm_ctr) / nrm_s; b = (b - nrm_ctr) / nrm_s; c = (c - nrm_ctr) / nrm_s; d = (d - nrm_ctr) / nrm_s;
+    p = (p - nrm_ctr) / nrm_s;
+    vec2 e = b - a; vec2 f = d - a; vec2 g = a - b + c - d; vec2 h = p - a;
+    float k2 = ft_cr(g, f); float k1 = ft_cr(e, f) + ft_cr(h, g); float k0 = ft_cr(h, e);
+    float v;
+    if (abs(k2) < 1e-5) { v = -k0 / k1; }
+    else {
+        float sq = sqrt(max(k1 * k1 - 4.0 * k0 * k2, 0.0));
+        float qq = -0.5 * (k1 + (k1 >= 0.0 ? sq : -sq));
+        float v1 = qq / k2;
+        float v2 = abs(qq) > 1e-12 ? k0 / qq : v1;
+        v = (v1 >= -0.001 && v1 <= 1.001) ? v1 : v2;
+    }
+    vec2 den = e + g * v;
+    float u = abs(den.x) > abs(den.y) ? (h.x - f.x * v) / den.x : (h.y - f.y * v) / den.y;
+    if (u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0) return vec2(-10.0);
+    return vec2(u, v);
+}
+
+// Guarded silhouette alpha lookup. Replaces the previous inline
+// "in [0,1] -> texture(...).a, else 0" pattern (identical when warp is off).
+// When the warp is on, the [0,1] pre-check is dropped on purpose: the warped
+// image can legitimately extend outside the original texture rect, and
+// ft_warp_sample already returns transparent outside the warped quad.
+float ft_alpha(sampler2D tex, vec2 p) {
+    if (ft_warp_enabled < 0.5) {
+        if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) return texture(tex, p).a;
+        return 0.0;
+    }
+    vec2 w = ft_warp_sample(p);
+    if (w.x < -5.0) return 0.0;
+    return texture(tex, w).a;
+}
+
 // Source alpha at a UV. Stretch mode: plain texture lookup (uv is pre-warped by
 // the inverse-map in fragment()). Extrude mode: directional sweep — light this
 // point if the silhouette covers any point back along -proj_dir within length,
@@ -122,22 +193,27 @@ float check_polyline(vec2 world_pos, vec4 def, int normal_start) {
 // light direction, which is what a real cast shadow does (clean on boxes).
 uniform int extrude_steps = 18;
 float src_alpha(sampler2D tex, vec2 p) {
-    float m = 0.0;
-    if (p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) {
-        m = texture(tex, p).a;
-    }
+    float m = ft_alpha(tex, p);
     if (proj_enabled > 0.5 && proj_extrude > 0.5 && proj_length > 0.01) {
         float fsteps = float(extrude_steps);
         float total_px = proj_length * max(proj_tex_size.x, proj_tex_size.y);
         float step_px = total_px / fsteps;
         vec2 duv = (proj_dir * step_px) / proj_tex_size;
+        // Fine near-field pass: 4 sub-samples inside the FIRST coarse step. At
+        // long distances a coarse step (up to ~50 texpx) overshoots the shallow
+        // grazing chords of the silhouette near its rim, detaching the shadow
+        // from the asset edge by up to one step (a gap that grows with distance).
+        for (int s = 1; s <= 4; s++) {
+            float f = 0.2 * float(s);
+            vec2 q = p - duv * f;
+            float w = 1.0 - proj_fade * (f / fsteps);
+            m = max(m, ft_alpha(tex, q) * w);
+        }
         for (int s = 1; s <= 64; s++) {
             if (s > extrude_steps) break;
             vec2 q = p - duv * float(s);
-            if (q.x >= 0.0 && q.x <= 1.0 && q.y >= 0.0 && q.y <= 1.0) {
-                float w = 1.0 - proj_fade * (float(s) / fsteps);
-                m = max(m, texture(tex, q).a * w);
-            }
+            float w = 1.0 - proj_fade * (float(s) / fsteps);
+            m = max(m, ft_alpha(tex, q) * w);
         }
     }
     return m;
@@ -170,27 +246,33 @@ void fragment() {
     vec2 uv = UV * v_scale;
     uv -= (v_scale - vec2(1.0)) * 0.5;
 
-    // Discard the shadow under the asset (it would be hidden anyway, and this keeps
-    // it from showing through transparent parts of the asset). The mask is eroded
-    // ~2px so the shadow still tucks a couple of pixels under the asset edge for a
-    // seamless junction. Runs before the blur loop, so these pixels skip the blur.
+    // Under-asset cut. The mask is eroded ~2px so the shadow still tucks a couple
+    // of pixels under the asset edge for a seamless junction.
     // Offset mode: the shadow sprite is displaced, so the asset alpha that overlaps
     // this fragment lives at uv + cut_offset. Projected: cut_offset is 0 (co-located).
+    // NOTE: this used to be a binary `if (er_a >= 0.5) discard`. Many DD asset PNGs
+    // carry a baked-in semi-transparent halo/shading (often stronger on one side):
+    // every halo pixel with alpha >= 0.5 killed the shadow while being nearly
+    // invisible on screen, leaving a pale band between the visible asset edge and
+    // the shadow body (rotating with the asset, in both projected sub-modes).
+    // A continuous attenuation by the asset coverage has no threshold step: the
+    // asset already composites over the shadow with its own alpha, so scaling the
+    // shadow by (1 - alpha) keeps the junction seamless for ANY alpha profile.
+    // Fully opaque interiors still discard early to skip the blur loop (perf).
+    float cut_mul = 1.0;
     {
         vec2 cuv = uv + cut_offset;
-        float er_a = 0.0;
-        if (cuv.x >= 0.0 && cuv.x <= 1.0 && cuv.y >= 0.0 && cuv.y <= 1.0)
-            er_a = texture(TEXTURE, cuv).a;
+        // ft_alpha keeps the cut hole under the WARPED asset (identical to the
+        // previous guarded lookups when the warp is off).
+        float er_a = ft_alpha(TEXTURE, cuv);
         vec2 er = 2.0 * TEXTURE_PIXEL_SIZE;
         for (int k = 0; k < 6; k++) {
             float ang = 6.28318 * float(k) / 6.0;
             vec2 su = cuv + vec2(cos(ang), sin(ang)) * er;
-            float sa = 0.0;
-            if (su.x >= 0.0 && su.x <= 1.0 && su.y >= 0.0 && su.y <= 1.0)
-                sa = texture(TEXTURE, su).a;
-            er_a = min(er_a, sa);
+            er_a = min(er_a, ft_alpha(TEXTURE, su));
         }
-        if (er_a >= 0.5) discard;
+        if (er_a >= 0.999) discard;
+        cut_mul = 1.0 - clamp(er_a, 0.0, 1.0);
     }
 
     // Projected (cast) shadow: instead of moving geometry, we inverse-map each
@@ -255,6 +337,6 @@ void fragment() {
     } else {
         alpha = raw_alpha;
     }
-    alpha = clamp(alpha * shadow_strength * proj_fade_mul, 0.0, 1.0);
+    alpha = clamp(alpha * shadow_strength * proj_fade_mul, 0.0, 1.0) * cut_mul;
     COLOR = vec4(shadow_color.rgb, alpha);
 }
