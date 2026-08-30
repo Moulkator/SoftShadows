@@ -1,5 +1,8 @@
 SOFT SHADOWS
 
+v1.6.1
+- Added self update checker (popup when there's a new version available)
+
 v1.6.0
 - New Building Shadow feature in the Pattern Tool
 - New Soft Clipping feature for lights
