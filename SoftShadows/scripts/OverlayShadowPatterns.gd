@@ -50,6 +50,10 @@ const SNAP_KEYS = ["snap_45", "snap_135", "snap_225", "snap_315"]
 const SOFT_OFFSET_MAX = 100.0   # DropShadowPatterns.OFFSET_MAX (dial radius)
 
 var _shader: Shader = null
+# World sun angle (deg, 0 = right / 90 = down) imposed by Global Illumination on
+# EVERY overlay (linked, unlinked and locked alike), or null when it is off.
+# Render-time only: the overlays' own settings are never rewritten.
+var _global_sun = null
 var ui = {}
 var pt_ui = {}
 var _syncing = false
@@ -257,9 +261,14 @@ func _apply_params(ov, shape, cfg: Dictionary) -> void:
 		if ls != null:
 			sun_deg = ls[0]
 			strength = ls[1]
+	var locked = cfg.get("lock_sun", false)
+	if _global_sun != null:
+		# Global Illumination: one WORLD sun for every overlay, link and lock included.
+		sun_deg = _global_sun
+		locked = false
 	var sun_vec = Vector2(cos(deg2rad(sun_deg)), sin(deg2rad(sun_deg)))
 	var local_sun = sun_vec
-	if not cfg.get("lock_sun", false):
+	if not locked:
 		local_sun = shape.transform.affine_inverse().basis_xform(sun_vec)
 	mat.set_shader_param("local_sun", local_sun)
 	mat.set_shader_param("sun_strength", strength)
@@ -738,13 +747,44 @@ func _store(prefix: String) -> Dictionary:
 func _update_link_enabled(store: Dictionary) -> void:
 	if not store.has("link_sun"):
 		return
-	store["link_sun"].disabled = store["lock_sun"].pressed
+	# While Global Illumination drives the overlays, the whole sun row is greyed
+	# (angle only: Distance stays the overlay's own).
+	var gi = _global_sun != null
+	store["link_sun"].disabled = store["lock_sun"].pressed or gi
+	store["lock_sun"].disabled = gi
 	var en = not store["link_sun"].pressed
 	var tint = Color(1, 1, 1, 1.0) if en else Color(1, 1, 1, 0.4)
-	store["angle_spin"].editable = en
-	store["angle_spin"].modulate = tint
+	store["angle_spin"].editable = en and not gi
+	store["angle_spin"].modulate = tint if not gi else Color(1, 1, 1, 0.4)
+	store["angle_spin"].hint_tooltip = "Driven by Global Illumination" if gi else ""
 	store["strength_spin"].editable = en
 	store["strength_spin"].modulate = tint
+	if store.has("dial"):
+		store["dial"].mouse_filter = Control.MOUSE_FILTER_IGNORE if gi else Control.MOUSE_FILTER_STOP
+		store["dial"].modulate = Color(1, 1, 1, 0.4) if gi else Color(1, 1, 1, 1.0)
+		store["dial"].hint_tooltip = "Driven by Global Illumination" if gi else ""
+	for k in SNAP_KEYS:
+		if store.has(k):
+			store[k].disabled = gi
+
+# Global Illumination: impose `deg` (world sun angle) on every overlay, or
+# null to give them back their own sun. Re-pushes the shader params of every
+# live overlay (no rebuild) and greys the sun rows while it is on.
+func set_global_sun(deg) -> void:
+	var v = null if deg == null else float(deg)
+	if v == _global_sun:
+		return
+	_global_sun = v
+	for nid in _active.keys():
+		var shape = _active[nid]["node"]
+		if shape == null or not is_instance_valid(shape):
+			continue
+		var ov = _get_overlay_node(shape)
+		var cfg = _saved_cfg(nid)
+		if ov != null and cfg != null:
+			_apply_params(ov, shape, cfg)
+	for store in [ui, pt_ui]:
+		_update_link_enabled(store)
 
 func _cfg_from_store(store: Dictionary) -> Dictionary:
 	var cfg = DEFAULTS.duplicate(true)

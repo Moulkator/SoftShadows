@@ -1472,6 +1472,10 @@ func apply_to_selected(force_all: bool = false, changed_keys: Array = []) -> voi
 			for key in changed_keys:
 				if ui_cfg.has(key):
 					cfg[key] = ui_cfg[key]
+			# A size slider also stamps the current Blur Control style,
+			# otherwise a shadow authored in the other style ignores it.
+			if size_touched and ui_cfg.has("slider_style"):
+				cfg["slider_style"] = ui_cfg["slider_style"]
 		else:
 			cfg = ui_cfg
 		if _layer_reset_pending and cfg.get("custom_layer", false):
@@ -1540,6 +1544,12 @@ func get_shadow_offset(node):
 	var cfg = _saved_cfg(_node_id(node))
 	var off = _offset_from_angle(float(cfg.get("sun_angle", 0.0)), float(cfg.get("offset_dist", 0.0)))
 	return [round(off.x), round(off.y)]
+
+# Style tag for Global Illumination: a mode switch is not a hand edit.
+func get_shadow_style(node):
+	if not has_shadow_enabled(node):
+		return null
+	return _saved_cfg(_node_id(node)).get("render_mode", "simple")
 
 func set_shadow_offset(node, ox: float, oy: float) -> void:
 	if not has_shadow_enabled(node):

@@ -30,6 +30,10 @@ const DEFAULTS = {
 }
 
 var _shader: Shader = null
+# World sun angle (deg, 0 = right / 90 = down) imposed by Global Illumination on
+# EVERY overlay (linked, unlinked and locked alike), or null when it is off.
+# Render-time only: the overlays' own settings are never rewritten.
+var _global_sun = null
 var ui = {}
 var _syncing = false
 var _monitored = null
@@ -278,6 +282,11 @@ func _apply_params(ov, cfg: Dictionary, rot: float) -> void:
 	else:
 		ov.set_meta("_world_sun", sun_vec)
 		local_sun = ov.global_transform.affine_inverse().basis_xform(sun_vec)
+	if _global_sun != null:
+		# Global Illumination: one WORLD sun for every overlay, link and lock
+		# included. The metas above keep the overlay's own sun for when it is off.
+		var gr = deg2rad(_global_sun)
+		local_sun = ov.global_transform.affine_inverse().basis_xform(Vector2(cos(gr), sin(gr)))
 	mat.set_shader_param("local_sun", local_sun)
 	mat.set_shader_param("tex_size", size)
 	# Mirror our params under the ovr_ prefix too: MERGED materials (source
@@ -585,7 +594,16 @@ func _on_frame_pre_draw() -> void:
 			if not (ft_sig == null and ft_prev == null) and ft_sig != ft_prev:
 				_apply_ft_warp_params(ov, obj)
 			var locked = false
-			if obj != null and obj.has_meta("_overlay_config"):
+			if _global_sun != null:
+				# Global Illumination overrides link AND lock (world sun).
+				var gr = deg2rad(_global_sun)
+				ws = Vector2(cos(gr), sin(gr))
+				if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("sun_angle_slider"):
+					_syncing = true
+					ui["sun_angle_slider"].value = round(_global_sun)
+					ui["sun_angle_spin"].value = round(_global_sun)
+					_syncing = false
+			elif obj != null and obj.has_meta("_overlay_config"):
 				var ocfg = obj.get_meta("_overlay_config")
 				if ocfg is Dictionary and ocfg.get("lock_sun", false):
 					locked = true
@@ -598,7 +616,8 @@ func _on_frame_pre_draw() -> void:
 						# Reflect the live linked angle in the UI of the selected object.
 						if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("sun_angle_slider"):
 							_syncing = true
-							_set_sun_controls(lsun)
+							ui["sun_angle_slider"].value = round(lsun)
+							ui["sun_angle_spin"].value = round(lsun)
 							_syncing = false
 			var live_ls
 			if locked:
@@ -911,7 +930,7 @@ func build_ui() -> void:
 	_update_link_enabled(DEFAULTS["link_sun"])
 
 	_add_slider(sp, "Coverage", "coverage", 0.0, 1.0, 0.01)
-	_add_slider(sp, "Blur", "diffusion", 0.0, 1.0, 0.01)
+	_add_slider(sp, "Diffusion", "diffusion", 0.0, 1.0, 0.01)
 	_add_slider(sp, "Curve", "curve", -2.0, 2.0, 0.01)
 	_add_slider(sp, "Opacity", "opacity", 0.05, 1.0, 0.01)
 
@@ -1153,7 +1172,7 @@ func _on_lock_toggled(pressed) -> void:
 	# unlock -> local angle becomes the equivalent WORLD angle
 	var xf = _monitored_sun_xform()
 	if xf != null:
-		var deg = _world_from_spin(ui["sun_angle_spin"].value)
+		var deg = ui["sun_angle_spin"].value
 		var v = Vector2(cos(deg2rad(deg)), sin(deg2rad(deg)))
 		if pressed:
 			# If we were linked, start from the live linked world angle.
@@ -1168,7 +1187,8 @@ func _on_lock_toggled(pressed) -> void:
 			v = xf.basis_xform(v)
 		if v.length_squared() > 0.0:
 			var nd = fmod(rad2deg(atan2(v.y, v.x)) + 360.0, 360.0)
-			_set_sun_controls(nd)
+			ui["sun_angle_slider"].value = round(nd)
+			ui["sun_angle_spin"].value = round(nd)
 	_syncing = false
 	_update_link_enabled(ui["link_sun"].pressed)
 	apply_to_selected(false, ["lock_sun", "link_sun", "sun_angle"])
@@ -1186,16 +1206,42 @@ func _monitored_sun_xform():
 func _update_link_enabled(linked) -> void:
 	# When linked, the Sun ° controls are driven by the soft shadow -> grey + lock.
 	# The Link button itself is greyed out while the sun is locked to the texture.
+	# While Global Illumination drives the overlays, the whole Sun row is greyed.
+	var gi = _global_sun != null
 	if ui.has("link_sun") and ui.has("lock_sun"):
-		ui["link_sun"].disabled = ui["lock_sun"].pressed
-	var en = not linked
+		ui["link_sun"].disabled = ui["lock_sun"].pressed or gi
+		ui["lock_sun"].disabled = gi
+	var en = not linked and not gi
 	var tint = Color(1, 1, 1, 1.0) if en else Color(1, 1, 1, 0.4)
+	var tip = "Driven by Global Illumination" if gi else ""
 	if ui.has("sun_angle_slider"):
 		ui["sun_angle_slider"].editable = en
 		ui["sun_angle_slider"].modulate = tint
+		ui["sun_angle_slider"].hint_tooltip = tip
 	if ui.has("sun_angle_spin"):
 		ui["sun_angle_spin"].editable = en
 		ui["sun_angle_spin"].modulate = tint
+		ui["sun_angle_spin"].hint_tooltip = tip
+
+# Global Illumination: impose `deg` (world sun angle) on every overlay, or
+# null to give them back their own sun. The per-frame sync picks it up; the
+# Sun row of the panel is greyed while it is on.
+func set_global_sun(deg) -> void:
+	var v = null if deg == null else float(deg)
+	if v == _global_sun:
+		return
+	_global_sun = v
+	if ui.has("link_sun"):
+		_update_link_enabled(ui["link_sun"].pressed)
+	# Re-push the sun once now (otherwise the per-frame sync would do it) and
+	# restore the selected object's own angle in the UI when it comes back.
+	if v == null and _monitored != null and is_instance_valid(_monitored) and _monitored.has_meta("_overlay_config"):
+		var ocfg = _monitored.get_meta("_overlay_config")
+		if ocfg is Dictionary and ui.has("sun_angle_slider"):
+			_syncing = true
+			ui["sun_angle_slider"].value = round(float(ocfg.get("sun_angle", DEFAULTS["sun_angle"])))
+			ui["sun_angle_spin"].value = round(float(ocfg.get("sun_angle", DEFAULTS["sun_angle"])))
+			_syncing = false
 
 func _linked_sun_angle(node_id):
 	# World sun angle (deg) of the object's soft (drop) shadow, or null if none.
@@ -1226,24 +1272,10 @@ func _linked_sun_angle(node_id):
 ## CONFIG <-> UI
 #########################################################################################################
 
-# The Sun ° controls show the same convention as the Soft Shadow dial (0° =
-# sun at noon / top, 90° = right, clockwise). Internally sun_angle stays in
-# world degrees (0 = right, 90 = down): displayed = world + 90.
-func _spin_from_world(world_deg: float) -> float:
-	return fposmod(world_deg + 90.0, 360.0)
-
-func _world_from_spin(spin_deg: float) -> float:
-	return fposmod(spin_deg - 90.0, 360.0)
-
-func _set_sun_controls(world_deg: float) -> void:
-	var v = round(_spin_from_world(world_deg))
-	ui["sun_angle_slider"].value = v
-	ui["sun_angle_spin"].value = v
-
 func get_config_from_ui() -> Dictionary:
 	return {
 		"enabled": ui["enable"].pressed,
-		"sun_angle": _world_from_spin(ui["sun_angle_spin"].value),
+		"sun_angle": ui["sun_angle_spin"].value,
 		"coverage": ui["coverage_spin"].value,
 		"diffusion": ui["diffusion_spin"].value,
 		"curve": ui["curve_spin"].value,
@@ -1264,10 +1296,9 @@ func load_ui_from_object(obj) -> void:
 			cfg[k] = global.ModMapData[DATA_KEY][nid][k]
 	_syncing = true
 	ui["enable"].pressed = cfg.get("enabled", false)
-	for key in ["coverage", "diffusion", "curve", "opacity"]:
+	for key in ["sun_angle", "coverage", "diffusion", "curve", "opacity"]:
 		ui[key + "_slider"].value = cfg[key]
 		ui[key + "_spin"].value = cfg[key]
-	_set_sun_controls(float(cfg["sun_angle"]))
 	var sc = cfg.get("shadow_color", Color(0, 0, 0, 1))
 	if sc is String:
 		sc = Color(sc)

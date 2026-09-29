@@ -1318,69 +1318,9 @@ func initialise() -> void:
 
 #########################################################################################################
 ##
-## WALL TOOL SIGNALS & SPLIT DETECTION
+## SPLIT DETECTION
 ##
 #########################################################################################################
-
-func _register_wall_tool_signals():
-	var tool_name = "WallTool"
-	# OnStartEditWall, OnUpdateEditWall, OnEndEditWall, OnEndWall pass (node)
-	for signal_name in ["OnEndWall", "OnStartEditWall", "OnUpdateEditWall", "OnEndEditWall"]:
-		global.Editor.Tools[tool_name].connect(signal_name, self, "_on_wall_tool_signal", [signal_name])
-	# OnStartWall passes no node arg
-	global.Editor.Tools[tool_name].connect("OnStartWall", self, "_on_wall_tool_signal_no_node", ["OnStartWall"])
-
-func _on_wall_tool_signal_no_node(signal_name: String):
-	pass
-
-func _on_wall_tool_signal(node, signal_name: String):
-	match signal_name:
-		"OnEndWall":
-			# Wall drawing completed — apply shadow if wall tool toggle is ON
-			if _wall_tool_toggle != null and _wall_tool_toggle.pressed:
-				if node != null and is_instance_valid(node) and is_shadow_node_type(node):
-					# Delay slightly to let DD finish building the wall node
-					call_deferred("_apply_wall_tool_shadow", node)
-		"OnUpdateEditWall", "OnEndEditWall":
-			# Refresh shadow on wall point edits
-			if node != null and is_instance_valid(node) and is_shadow_node_type(node):
-				_refresh_wall_shadow(node)
-
-func _apply_wall_tool_shadow(wall):
-	if wall == null or not is_instance_valid(wall):
-		return
-	if not wall.has_meta("node_id"):
-		# Wall might not be ready yet, retry after a short delay
-		yield(global.Editor.get_tree().create_timer(0.1), "timeout")
-		if wall == null or not is_instance_valid(wall):
-			return
-		if not wall.has_meta("node_id"):
-			return
-	var node_id = str(wall.get_meta("node_id"))
-	# Don't overwrite if wall already has shadow data
-	if global.ModMapData.has(SHADOW_DATA_KEY) and global.ModMapData[SHADOW_DATA_KEY].has(node_id):
-		return
-	var cfg = _get_wall_tool_config()
-	remove_shadow(wall)
-	create_shadow(wall, cfg)
-	save_shadow_data(wall, cfg)
-	_all_known_path_ids[node_id] = true
-	_all_points_hashes[node_id] = _get_points_hash(wall)
-	outputlog("Applied wall tool shadow to wall " + node_id, 1)
-
-func _refresh_wall_shadow(wall):
-	if not wall.has_meta("node_id"):
-		return
-	var node_id = str(wall.get_meta("node_id"))
-	if not global.ModMapData.has(SHADOW_DATA_KEY):
-		return
-	if not global.ModMapData[SHADOW_DATA_KEY].has(node_id):
-		return
-	var config = global.ModMapData[SHADOW_DATA_KEY][node_id]
-	if config.get("enabled", false):
-		remove_shadow(wall)
-		create_shadow(wall, config)
-		_all_points_hashes[node_id] = _get_points_hash(wall)
 
 # Called by DD when a new node is added to the world (used for split/copy detection)
 # We MUST NOT modify any collections here as DD is iterating its mod list
@@ -1420,6 +1360,13 @@ func _deferred_on_new_node_added(node):
 	# Only paste/duplicate/split flows should copy configs. Without this guard
 	# the source's shadow flashed on the new path for a fraction of a second.
 	if node == _pt_editing_path or node == _pt_finalized_path:
+		return
+	# The guard above only works while the tool toggle is ON (the editing path
+	# is only tracked then). With the toggle OFF, a path drawn with the Path
+	# Tool could still inherit a shadow through the split/copy detection
+	# (selected path, same geometry). Copy/paste only exist in the Select Tool,
+	# so any path created while the Path Tool is active is a fresh draw.
+	if node_type == "paths" and str(global.Editor.ActiveToolName) == "PathTool":
 		return
 
 	# --- Try split detection (wall/path geometry changed) ---
@@ -2026,9 +1973,9 @@ func _get_path_tool_config(path = null) -> Dictionary:
 	cfg["softness"] = pt_ui["softness_spin"].value
 	if pt_ui.has("simple_blur_spin"):
 		cfg["simple_blur"] = pt_ui["simple_blur_spin"].value
-	# Style of the loaded/monitored config; bumped to the CURRENT style when a
-	# size slider is touched. Fresh shadows default to the current style.
-	cfg["slider_style"] = int(pt_ui.get("loaded_slider_style", 1 if _simple_blur_style_enabled() else 0))
+	# A shadow placed by a tool always takes the CURRENT Blur Control style:
+	# the panel only shows that style's size rows.
+	cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
 	cfg["direction"] = _get_pt_direction()
 	cfg["render_mode"] = _get_pt_render_mode()
 	if pt_ui.has("realistic_blur_spin"):
@@ -2152,9 +2099,9 @@ func _on_path_tool_shadow_toggled(pressed):
 		pt_ui["cog_btn"].visible = pressed
 	if pt_ui.has("reset_btn"):
 		pt_ui["reset_btn"].visible = pressed
-	if pressed:
-		_sync_pt_ui_from_defaults()
-	else:
+	# Turning the shadow back ON keeps the current tool settings (same as the
+	# Wall Tool); defaults are only reloaded via the Reset button.
+	if not pressed:
 		if pt_ui.has("settings"):
 			pt_ui["settings"].visible = false
 		if pt_ui.has("cog_btn"):
@@ -2245,211 +2192,6 @@ func _reparent_pt_extend_toggle(cog_open: bool):
 			ext_hbox.get_parent().remove_child(ext_hbox)
 		dir_wrapper.add_child(ext_hbox)
 
-#########################################################################################################
-##
-## WALL TOOL UI
-##
-#########################################################################################################
-
-var wt_ui = {}  # WallTool UI controls
-var _wall_tool_toggle = null  # Reference to wall tool enable checkbox
-
-func _build_wall_tool_ui():
-	var wall_tool_panel = global.Editor.Toolset.GetToolPanel("WallTool")
-	if wall_tool_panel == null:
-		outputlog("WallTool panel not found", 1)
-		return
-	var align_vbox = core.get_align_vbox(wall_tool_panel)
-	if align_vbox == null:
-		outputlog("WallTool Align VBox not found", 1)
-		return
-
-	# Insert at the end of the panel
-	var insert_after = align_vbox.get_child_count()
-
-	# Main container
-	var wt_container = VBoxContainer.new()
-	wt_container.name = "DropShadowWallTool"
-
-	var sep1 = HSeparator.new()
-	sep1.add_constant_override("separation", 4)
-	wt_container.add_child(sep1)
-
-	# Title row: "Soft Shadow" [reset] [cog] [ON/OFF]
-	var title_hbox = HBoxContainer.new()
-	var wt_cloud = _create_cloud_icon()
-	if wt_cloud != null:
-		title_hbox.add_child(wt_cloud)
-	var title_label = Label.new()
-	title_label.text = "Soft Shadow"
-	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title_hbox.add_child(title_label)
-	var wt_reset_btn = _make_icon_button("icons/reset.png", "Reset to defaults", 0.5)
-	wt_reset_btn.visible = false
-	wt_reset_btn.connect("pressed", self, "_on_wt_reset_pressed")
-	title_hbox.add_child(wt_reset_btn)
-	wt_ui["reset_btn"] = wt_reset_btn
-	var wt_cog = _make_icon_button("icons/cog.png", "Show/hide settings", 0.55)
-	wt_cog.toggle_mode = true
-	wt_cog.pressed = false
-	wt_cog.visible = false
-	wt_cog.connect("toggled", self, "_on_wt_cog_toggled")
-	title_hbox.add_child(wt_cog)
-	wt_ui["cog_btn"] = wt_cog
-	var wt_enable = CheckButton.new()
-	wt_enable.pressed = false
-	title_hbox.add_child(wt_enable)
-	_wall_tool_toggle = wt_enable
-	wt_ui["enable_check"] = wt_enable
-	wt_container.add_child(title_hbox)
-
-	# Direction buttons (visible when ON, outside settings panel)
-	var dir_wrapper = VBoxContainer.new()
-	dir_wrapper.visible = false
-	wt_ui["dir_wrapper"] = dir_wrapper
-	var dir_hbox = HBoxContainer.new()
-	var dir_names = ["Side A", "Side B", "Both"]
-	for i in range(3):
-		var btn = Button.new()
-		btn.text = " " + dir_names[i]
-		btn.toggle_mode = true
-		btn.pressed = (i == int(DEFAULT_SHADOW_CONFIG["direction"]))
-		btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		btn.align = Button.ALIGN_LEFT
-		if i == int(DEFAULT_SHADOW_CONFIG["direction"]):
-			btn.icon = btn.get_icon("radio_checked", "CheckBox")
-		else:
-			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
-		btn.connect("pressed", self, "_on_wt_direction_pressed", [i])
-		dir_hbox.add_child(btn)
-		wt_ui["dir_btn_" + str(i)] = btn
-	dir_wrapper.add_child(dir_hbox)
-	wt_container.add_child(dir_wrapper)
-
-	# Settings panel (visible via cog toggle)
-	var wt_settings = VBoxContainer.new()
-	wt_settings.visible = false
-	wt_ui["settings"] = wt_settings
-
-	# Opacity
-	wt_settings.add_child(_make_wt_slider_row("Opacity", "opacity", 0.05, 1.0, 0.05, DEFAULT_SHADOW_CONFIG["opacity"]))
-	# Spread
-	wt_settings.add_child(_make_wt_slider_row("Spread", "spread", 0.0, 3.0, 0.05, DEFAULT_SHADOW_CONFIG["spread"]))
-	# Softness
-	wt_settings.add_child(_make_wt_slider_row("Softness", "softness", 0.1, 10.0, 0.25, DEFAULT_SHADOW_CONFIG["softness"]))
-
-	# Extend Ends with Fade
-	var wt_ext_sep = HSeparator.new()
-	wt_ext_sep.add_constant_override("separation", 2)
-	wt_settings.add_child(wt_ext_sep)
-	var wt_ext_hbox = HBoxContainer.new()
-	var wt_ext_label = Label.new()
-	wt_ext_label.text = "Extend Ends with Fade"
-	wt_ext_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	wt_ext_hbox.add_child(wt_ext_label)
-	var wt_ext_check = CheckButton.new()
-	wt_ext_check.pressed = false
-	wt_ext_check.connect("toggled", self, "_on_wt_extend_toggled")
-	wt_ext_hbox.add_child(wt_ext_check)
-	wt_ui["extend_check"] = wt_ext_check
-	wt_ui["wt_ext_hbox"] = wt_ext_hbox
-	# Initially in dir_wrapper (cog closed)
-	dir_wrapper.add_child(wt_ext_hbox)
-
-	wt_container.add_child(wt_settings)
-
-	var sep2 = HSeparator.new()
-	sep2.add_constant_override("separation", 4)
-	wt_container.add_child(sep2)
-
-	align_vbox.add_child(wt_container)
-
-	# Connect AFTER everything is built
-	wt_enable.connect("toggled", self, "_on_wall_tool_shadow_toggled")
-
-	outputlog("WallTool UI built successfully", 1)
-
-func _make_wt_slider_row(label_text: String, key: String, min_val: float, max_val: float, step_val: float, default_val: float) -> HBoxContainer:
-	var hbox = HBoxContainer.new()
-	var label = Label.new()
-	label.text = label_text
-	label.rect_min_size.x = 60
-	hbox.add_child(label)
-	var slider = HSlider.new()
-	slider.min_value = min_val
-	slider.max_value = max_val
-	slider.step = step_val
-	slider.value = default_val
-	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	slider.connect("value_changed", self, "_on_wt_slider_changed", [key])
-	hbox.add_child(slider)
-	wt_ui[key + "_slider"] = slider
-	var spin = SpinBox.new()
-	spin.min_value = min_val
-	spin.max_value = max_val
-	spin.step = step_val
-	spin.value = default_val
-	spin.connect("value_changed", self, "_on_wt_spin_changed", [key])
-	hbox.add_child(spin)
-	wt_ui[key + "_spin"] = spin
-	var reset = _make_icon_button("icons/reset.png", "Reset " + label_text.to_lower(), 0.5)
-	reset.connect("pressed", self, "_on_wt_single_reset", [key])
-	hbox.add_child(reset)
-	return hbox
-
-func _get_wall_tool_config() -> Dictionary:
-	var cfg = FACTORY_DEFAULTS.duplicate()
-	# Apply user wall defaults if they exist
-	if global.ModMapData.has(USER_DEFAULTS_WALL_KEY):
-		var user_def = global.ModMapData[USER_DEFAULTS_WALL_KEY]
-		for key in user_def.keys():
-			cfg[key] = user_def[key]
-	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_WALL_KEY, null))
-	cfg["enabled"] = true
-	if not wt_ui.has("opacity_spin"):
-		return cfg
-	cfg["opacity"] = wt_ui["opacity_spin"].value
-	cfg["spread"] = wt_ui["spread_spin"].value
-	cfg["softness"] = wt_ui["softness_spin"].value
-	cfg["direction"] = _get_wt_direction()
-	# Extend
-	if wt_ui.has("extend_check"):
-		cfg["extend_enabled"] = wt_ui["extend_check"].pressed
-		if wt_ui["extend_check"].pressed:
-			cfg["fade_in_enabled"] = true
-			cfg["fade_out_enabled"] = true
-		else:
-			cfg["fade_in_enabled"] = false
-			cfg["fade_out_enabled"] = false
-	return cfg
-
-func _get_wt_direction() -> int:
-	for i in range(3):
-		if wt_ui.has("dir_btn_" + str(i)) and wt_ui["dir_btn_" + str(i)].pressed:
-			return i
-	return 0
-
-func _on_wt_direction_pressed(dir_index):
-	for i in range(3):
-		var btn = wt_ui["dir_btn_" + str(i)]
-		btn.pressed = (i == dir_index)
-		if i == dir_index:
-			btn.icon = btn.get_icon("radio_checked", "CheckBox")
-		else:
-			btn.icon = btn.get_icon("radio_unchecked", "CheckBox")
-
-func _on_wt_slider_changed(value, which):
-	wt_ui[which + "_spin"].value = value
-
-func _on_wt_spin_changed(value, which):
-	wt_ui[which + "_slider"].value = value
-
-func _on_wt_single_reset(which):
-	var def_val = _get_effective_default_for_tool(which, USER_DEFAULTS_WALL_KEY)
-	wt_ui[which + "_slider"].value = def_val
-	wt_ui[which + "_spin"].value = def_val
-
 # Returns the effective default value for a tool panel slider reset,
 # checking user defaults for the given key, then falling back to FACTORY_DEFAULTS.
 func _get_effective_default_for_tool(which: String, defaults_key: String):
@@ -2460,69 +2202,6 @@ func _get_effective_default_for_tool(which: String, defaults_key: String):
 	if which == "opacity" and _simple_blur_style_enabled():
 		return BLUR_STYLE_DEFAULT_OPACITY
 	return FACTORY_DEFAULTS[which]
-
-func _on_wt_reset_pressed():
-	_sync_wt_ui_from_defaults()
-
-func _on_wall_tool_shadow_toggled(pressed):
-	if wt_ui.has("dir_wrapper"):
-		wt_ui["dir_wrapper"].visible = pressed
-	if wt_ui.has("cog_btn"):
-		wt_ui["cog_btn"].visible = pressed
-	if wt_ui.has("reset_btn"):
-		wt_ui["reset_btn"].visible = pressed
-	if not pressed:
-		if wt_ui.has("settings"):
-			wt_ui["settings"].visible = false
-		if wt_ui.has("cog_btn"):
-			wt_ui["cog_btn"].pressed = false
-
-func _on_wt_cog_toggled(pressed):
-	if wt_ui.has("settings"):
-		wt_ui["settings"].visible = pressed
-	_reparent_wt_extend_toggle(pressed)
-
-func _on_wt_extend_toggled(_pressed):
-	pass
-
-func _reparent_wt_extend_toggle(cog_open: bool):
-	var ext_hbox = wt_ui.get("wt_ext_hbox")
-	if ext_hbox == null:
-		return
-	var settings = wt_ui.get("settings")
-	var dir_wrapper = wt_ui.get("dir_wrapper")
-	if cog_open:
-		if ext_hbox.get_parent() == settings:
-			return
-		if ext_hbox.get_parent() != null:
-			ext_hbox.get_parent().remove_child(ext_hbox)
-		if settings != null:
-			settings.add_child(ext_hbox)
-	else:
-		if ext_hbox.get_parent() == dir_wrapper:
-			return
-		if ext_hbox.get_parent() != null:
-			ext_hbox.get_parent().remove_child(ext_hbox)
-		dir_wrapper.add_child(ext_hbox)
-
-func _sync_wt_ui_from_defaults():
-	if not wt_ui.has("opacity_slider"):
-		return
-	var cfg = FACTORY_DEFAULTS.duplicate()
-	if global.ModMapData.has(USER_DEFAULTS_WALL_KEY):
-		var user_def = global.ModMapData[USER_DEFAULTS_WALL_KEY]
-		for key in user_def.keys():
-			cfg[key] = user_def[key]
-	_apply_style_factory_defaults(cfg, global.ModMapData.get(USER_DEFAULTS_WALL_KEY, null))
-	wt_ui["opacity_slider"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
-	wt_ui["opacity_spin"].value = cfg.get("opacity", FACTORY_DEFAULTS["opacity"])
-	wt_ui["spread_slider"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
-	wt_ui["spread_spin"].value = cfg.get("spread", FACTORY_DEFAULTS["spread"])
-	wt_ui["softness_slider"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
-	wt_ui["softness_spin"].value = cfg.get("softness", FACTORY_DEFAULTS["softness"])
-	_on_wt_direction_pressed(int(cfg.get("direction", FACTORY_DEFAULTS["direction"])))
-	if wt_ui.has("extend_check"):
-		wt_ui["extend_check"].pressed = cfg.get("extend_enabled", false)
 
 func _update_path_tool_live_shadow():
 	if _path_tool_toggle == null or not _path_tool_toggle.pressed:
@@ -4913,7 +4592,6 @@ func _on_save_default_pressed():
 	var key = USER_DEFAULTS_WALL_KEY if _monitored_type == "walls" else USER_DEFAULTS_KEY
 	global.ModMapData[key] = save_config
 	_sync_pt_ui_from_defaults()
-	_sync_wt_ui_from_defaults()
 	_update_reset_defaults_visibility()
 	outputlog("Current settings saved as " + _monitored_type + " defaults", 1)
 
@@ -4922,7 +4600,6 @@ func _on_reset_default_pressed():
 	if global.ModMapData.has(key):
 		global.ModMapData.erase(key)
 	_sync_pt_ui_from_defaults()
-	_sync_wt_ui_from_defaults()
 	_update_reset_defaults_visibility()
 	outputlog(_monitored_type + " defaults restored to factory settings", 1)
 
@@ -5737,10 +5414,9 @@ func apply_shadow_to_selected_paths():
 					for dkey in user_def.keys():
 						cfg[dkey] = user_def[dkey]
 				cfg["enabled"] = ui_cfg["enabled"]
-				# Fresh shadow: authored in the saved-default style if the user
-				# defaults carry one, else in the CURRENT slider style.
-				if not cfg.has("slider_style"):
-					cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
+				# Fresh shadow: always authored in the CURRENT Blur Control style
+				# (same rule as the tools), whatever style the defaults were saved in.
+				cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
 				_apply_style_factory_defaults(cfg, global.ModMapData.get(def_key, null))
 				if node_type == "paths" and not global.ModMapData.has(USER_DEFAULTS_KEY):
 					_apply_path_transitions(cfg, node)
@@ -5786,6 +5462,13 @@ func apply_shadow_to_selected_paths():
 					# c'est cette clé qu'il faut propager à la sélection.
 					if param_key == "opacity" and ui_cfg.get("render_mode", "simple") == "realistic":
 						eff_key = "opacity_realistic"
+					# Blur: both sliders are 0..1, so the same fraction goes to the
+					# key of THIS path's own mode (mixed Simple/Realistic selections).
+					if param_key == "simple_blur" or param_key == "realistic_blur":
+						if ui_cfg.has(param_key):
+							var blur_tgt = "realistic_blur" if saved.get("render_mode", "simple") == "realistic" else "simple_blur"
+							saved[blur_tgt] = ui_cfg[param_key]
+						continue
 					if ui_cfg.has(eff_key):
 						saved[eff_key] = ui_cfg[eff_key]
 			else:
@@ -8850,6 +8533,13 @@ func load_shadow_ui_from_path(path):
 	elif not has_saved and not has_user_defaults and get_node_type(path) == "walls":
 		_disable_wall_only_transitions(config)
 
+	# Fresh shadow (nothing saved yet): always the CURRENT Blur Control style,
+	# like tool-placed shadows. Without this, enabling the shadow from the
+	# Select Tool rendered it in the classic Spread/Softness style while the
+	# panel showed the Blur rows (different look vs. a tool-drawn shadow).
+	if not has_saved:
+		config["slider_style"] = 1 if _simple_blur_style_enabled() else 0
+
 	set_ui_without_signals(config)
 
 func set_ui_without_signals(config: Dictionary):
@@ -9127,8 +8817,8 @@ func _fresh_config_for(node) -> Dictionary:
 		var user_def = global.ModMapData[def_key]
 		for dkey in user_def.keys():
 			cfg[dkey] = user_def[dkey]
-	if not cfg.has("slider_style"):
-		cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
+	# Fresh shadow: always the CURRENT Blur Control style.
+	cfg["slider_style"] = 1 if _simple_blur_style_enabled() else 0
 	_apply_style_factory_defaults(cfg, global.ModMapData.get(def_key, null))
 	if node_type == "paths" and not global.ModMapData.has(USER_DEFAULTS_KEY):
 		_apply_path_transitions(cfg, node)
@@ -9172,6 +8862,12 @@ func get_shadow_offset(node):
 		return null
 	var cfg = global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))]
 	return [float(cfg.get("offset_x", 0.0)), float(cfg.get("offset_y", 0.0))]
+
+# Style tag for Global Illumination: a mode switch is not a hand edit.
+func get_shadow_style(node):
+	if not has_shadow_enabled(node):
+		return null
+	return global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))].get("render_mode", "simple")
 
 # Sets the shadow offset (world px), rebuilds, saves. No history (the caller
 # records its own transaction).
@@ -9619,7 +9315,6 @@ func apply_saved_shadows_to_map():
 	# known (e.g. wall opacity showed 0.6 instead of the Blur-style 0.4).
 	on_simple_slider_style_changed()
 	_sync_pt_ui_from_defaults()
-	_sync_wt_ui_from_defaults()
 
 	if global.ModMapData.has(SHADOW_DATA_KEY):
 		var shadow_data = global.ModMapData[SHADOW_DATA_KEY]

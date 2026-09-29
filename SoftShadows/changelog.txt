@@ -1,5 +1,16 @@
 SOFT SHADOWS
 
+v1.7.2
+- Fixed a bug affecting multiselection
+- Fixed a bug with the wall shadows not being the same in the wall tool and the selection tool in Realistic mode
+- Fixed a bug sometimes displaying a shadow for new walls even if the shadow was turned off
+- Fixed a wall's simple shadow acting weird when the wall was moved
+
+v1.7.1
+- Added overlays to Global Illumination
+- Added Stretch and Extrude to Global Illumination
+- Added Global Illumination to object preview
+
 v1.7.0
 - Added an option to set a custom shadow layer for Objects, Paths and Walls
 - Added patterns shadows
@@ -12,7 +23,7 @@ v1.7.0
 - Improved undo/redo reliability
 - Compatibility with Keep Object Lit option from the Unofficial Patch
 - Renamed "Diffusion" to "Blur" in the Overlays (Objects and Patterns)
-- Renamed "Crop Ends" to "Wrap Ends" and turned in ON by default in Realistic Mode
+- Renamed "Crop Ends" to "Wrap Ends" and turned it ON by default in Realistic Mode
 - Fixed cropped ends in Realistic Mode having a bit of a fade
 - Fixed wrong Sun° for overlays
 - Fixed Opacity being too low in Realistic Mode

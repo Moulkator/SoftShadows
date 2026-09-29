@@ -2181,14 +2181,20 @@ func _on_monitor_tick():
 			# extents, cut). Recreating the sprite here caused a one-frame flicker
 			# on every rotation step — only node/texture changes recreate now.
 			var current_rot = Vector3(preview.rotation, preview.scale.x, preview.scale.y)
-			var changed = preview != _obj_tool_preview_node or current_tex != _obj_tool_preview_tex
+			# Global Illumination: the ghost follows the global sun (recreated when
+			# the sun / GI state changes, like a texture swap).
+			var place_cfg = _get_placement_config()
+			var gi_t = _gi_target_for_config(preview, place_cfg)
+			var gi_sig = "" if gi_t == null else str(gi_t)
+			var changed = preview != _obj_tool_preview_node or current_tex != _obj_tool_preview_tex or gi_sig != _obj_tool_preview_gi
 			if changed:
 				if _obj_tool_preview_node != null and is_instance_valid(_obj_tool_preview_node):
 					remove_shadow(_obj_tool_preview_node)
 				_obj_tool_preview_node = preview
 				_obj_tool_preview_tex = current_tex
 				_obj_tool_preview_rot = current_rot
-				var config = _get_placement_config()
+				_obj_tool_preview_gi = gi_sig
+				var config = _gi_apply_to_config(preview, place_cfg)
 				remove_shadow(preview)
 				create_shadow(preview, config)
 			elif current_rot != _obj_tool_preview_rot:
@@ -3526,6 +3532,7 @@ var _obj_tool_preview_tex = null  # track texture to detect asset change
 # rotates the ghost. Without this, a projected shadow keeps the proj_dir derived
 # at creation time and spins WITH the asset instead of following the world angle.
 var _obj_tool_preview_rot = null  # Vector3(rotation, scale.x, scale.y)
+var _obj_tool_preview_gi = ""   # Global Illumination target shown on the preview ("" = none)
 
 func _find_shadow_checkbox(node, path):
 	"""Recursively find the native 'Shadow' CheckButton in ObjectTool."""
@@ -5980,6 +5987,10 @@ func apply_shadow_to_selected(force_all: bool = false, changed_keys: Array = [])
 			for key in changed_keys:
 				if ui_cfg.has(key):
 					cfg[key] = ui_cfg[key]
+				# A size slider also stamps the current Blur Control style,
+				# otherwise a shadow authored in the other style ignores it.
+				if key in ["blur", "spread", "softness"]:
+					cfg["slider_style"] = ui_cfg["slider_style"]
 			if _layer_reset_pending:
 				cfg["shadow_layer"] = node.z_index
 			elif cfg.get("custom_layer", false):
@@ -6079,8 +6090,15 @@ func load_shadow_ui_from_object(obj):
 		# Backward compat: migrate old "size"/"softness" to "blur"
 		if saved.has("size") and not saved.has("blur"):
 			config["blur"] = clamp(saved["size"] / 0.75, 0.0, 1.0)
+		# Legacy saves (with "size") used "softness" for something else: drop it
+		# ONLY for them — current saves keep their Spread/Softness value.
+		if saved.has("size"):
+			config.erase("softness")
 		config.erase("size")
-		config.erase("softness")
+	else:
+		# Fresh shadow: always the CURRENT Blur Control style (same rule as
+		# placement and the other submods), whatever the defaults were saved in.
+		config["slider_style"] = 1 if _simple_blur_style_enabled() else 0
 	if legacy_pre_quality:
 		config["quality"] = 100
 
@@ -6254,15 +6272,104 @@ func set_shadow_enabled(nodes, enabled: bool) -> void:
 ## OFFSET API (GlobalIllumination) — read / write one shadow's offset by data
 #########################################################################################################
 
-# [offset_x, offset_y] of the node's shadow, or null if it has no enabled shadow.
+# World px reached by ONE unit of proj_length for this object's shadow, so
+# Global Illumination can give a Projected shadow the same pixel reach as an
+# Offset one. Extrude: the sweep length (proj_length × max texture dim).
+# Stretch: the tip extension = silhouette half-extent along the cast direction
+# (from the anchor) × proj_length. Both scaled to world px. Falls back to a
+# flat 100 px = PROJ_MAX_LENGTH mapping when the sprite is not available.
+func _proj_px_per_unit(obj, cfg: Dictionary) -> float:
+	var fallback = OFFSET_MAX / PROJ_MAX_LENGTH
+	if obj == null or not is_instance_valid(obj):
+		return fallback
+	var sprite = get_sprite(obj)
+	if sprite == null or sprite.texture == null:
+		return fallback
+	var tex_size = sprite.texture.get_size()
+	if sprite.region_enabled:
+		tex_size = sprite.region_rect.size
+	if tex_size.x < 1.0 or tex_size.y < 1.0:
+		return fallback
+	var ws = (obj.global_transform.get_scale() * sprite.scale).abs()
+	var scale_max = max(max(ws.x, ws.y), 0.001)
+	var max_dim = max(tex_size.x, tex_size.y)
+	var texels = max_dim
+	if float(cfg.get("proj_extrude", 0.0)) < 0.5:
+		var ang = float(cfg.get("proj_angle", 0.0))
+		var ldir = obj.global_transform.affine_inverse().basis_xform(Vector2(cos(ang), sin(ang)))
+		ldir = ldir.normalized() if ldir.length() > 0.0001 else Vector2(0.0, 1.0)
+		var sil_along = tex_size.x * 0.5 * abs(ldir.x) + tex_size.y * 0.5 * abs(ldir.y)
+		var anchor = Vector2(
+			float(cfg.get("proj_anchor_x", 0.0)) * tex_size.x * 0.5,
+			float(cfg.get("proj_anchor_y", 0.0)) * tex_size.y * 0.5
+		) + _get_opaque_center_offset(sprite)
+		texels = max(sil_along - anchor.dot(ldir), max_dim * 0.1)
+	return max(texels * scale_max, 1.0)
+
+# [ox, oy] of the node's shadow (world px), or null if it has no enabled
+# shadow. Projected (Stretch / Extrude) shadows have no pixel offset: their
+# direction is proj_angle (shadow direction, world) and their reach is
+# proj_length × _proj_px_per_unit(). They are exposed as the equivalent vector
+# so Global Illumination gives every style the same pixel reach.
 func get_shadow_offset(node):
 	if not has_shadow_enabled(node):
 		return null
-	var cfg = global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))]
+	return _cfg_offset_vector(node, global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))])
+
+# Offset vector of a config dict for `obj` (see get_shadow_offset).
+func _cfg_offset_vector(obj, cfg: Dictionary) -> Array:
+	if cfg.get("shadow_mode", "offset") == "projected":
+		var l = clamp(float(cfg.get("proj_length", 0.0)), 0.0, PROJ_MAX_LENGTH) * _proj_px_per_unit(obj, cfg)
+		var a = float(cfg.get("proj_angle", 0.0))
+		return [round(cos(a) * l), round(sin(a) * l)]
 	return [float(cfg.get("offset_x", 0.0)), float(cfg.get("offset_y", 0.0))]
 
-# Sets the shadow offset (world px), rebuilds, saves. No history (the caller
-# records its own transaction).
+# Writes the offset vector into a config dict for `obj` (in place), honouring
+# its style (see get_shadow_offset). Returns the dict.
+func _cfg_set_offset(obj, cfg: Dictionary, ox: float, oy: float) -> Dictionary:
+	if cfg.get("shadow_mode", "offset") == "projected":
+		var v = Vector2(round(ox), round(oy))
+		if v.length() >= 0.5:   # a zero vector has no direction: keep the current angle
+			cfg["proj_angle"] = atan2(v.y, v.x)
+		# px/unit depends on the (new) angle in Stretch mode: compute it after.
+		cfg["proj_length"] = clamp(v.length() / _proj_px_per_unit(obj, cfg), 0.0, PROJ_MAX_LENGTH)
+	else:
+		cfg["offset_x"] = round(ox)
+		cfg["offset_y"] = round(oy)
+		# The dial range must contain the offset (range 1 = 100 px).
+		var need = ceil(max(abs(ox), abs(oy)) / OFFSET_MAX)
+		if need > float(cfg.get("range", 1.0)):
+			cfg["range"] = need
+	return cfg
+
+# Global Illumination as it will apply once placed: the target offset for a
+# config dict on `obj` ([ox, oy]) or null when GI is off / not wired.
+func _gi_target_for_config(obj, cfg: Dictionary):
+	if core == null or not ("global_illumination" in core):
+		return null
+	var gi = core.global_illumination
+	if gi == null or not gi.has_method("preview_offset"):
+		return null
+	return gi.preview_offset("objects", _cfg_offset_vector(obj, cfg))
+
+# Placement preview: a copy of `cfg` carrying the Global Illumination sun, so
+# the ghost shows the shadow the object will get. Unchanged copy when GI is off.
+func _gi_apply_to_config(obj, cfg: Dictionary) -> Dictionary:
+	var out = cfg.duplicate()
+	var t = _gi_target_for_config(obj, out)
+	if t == null:
+		return out
+	return _cfg_set_offset(obj, out, float(t[0]), float(t[1]))
+
+# Style tag for Global Illumination: a mode switch is not a hand edit.
+func get_shadow_style(node):
+	if not has_shadow_enabled(node):
+		return null
+	return global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))].get("shadow_mode", "offset")
+
+# Sets the shadow offset (see get_shadow_offset for the projected mapping),
+# rebuilds, saves, and keeps the panel in sync when the node is the one shown.
+# No history (the caller records its own transaction).
 func set_shadow_offset(node, ox: float, oy: float) -> void:
 	if not has_shadow_enabled(node):
 		return
@@ -6270,16 +6377,25 @@ func set_shadow_offset(node, ox: float, oy: float) -> void:
 	var cfg = global.ModMapData[SHADOW_DATA_KEY][nid].duplicate()
 	if cfg.has("shadow_color") and cfg["shadow_color"] is String:
 		cfg["shadow_color"] = Color(cfg["shadow_color"])
-	cfg["offset_x"] = round(ox)
-	cfg["offset_y"] = round(oy)
-	# The dial range must contain the offset (range 1 = 100 px).
-	var need = ceil(max(abs(ox), abs(oy)) / OFFSET_MAX)
-	if need > float(cfg.get("range", 1.0)):
-		cfg["range"] = need
+	var projected = cfg.get("shadow_mode", "offset") == "projected"
+	_cfg_set_offset(node, cfg, ox, oy)
 	if not _fast_update_shadow(node, cfg):
 		remove_shadow(node)
 		create_shadow(node, cfg)
 	save_shadow_data(node, cfg)
+	# Panel sync: the shown object's dial follows the new value.
+	if node == _monitored_object and not _loading_ui and ui_config.has("dial"):
+		_syncing_ui = true
+		if projected:
+			_apply_proj_ui_from_config(cfg)
+		else:
+			var rng = float(cfg.get("range", DEFAULT_SHADOW_CONFIG["range"]))
+			if ui_config.has("range_slider") and ui_config["range_slider"].value != rng:
+				ui_config["range_slider"].value = rng
+				ui_config["range_spin"].value = rng
+				_update_offset_range(rng, false)
+			_set_dial_from_offset(cfg["offset_x"], cfg["offset_y"])
+		_syncing_ui = false
 
 #########################################################################################################
 ## PRESETS (lib/ShadowPresets.gd) — adapter

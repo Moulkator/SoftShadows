@@ -8,14 +8,29 @@
 # shadow's previous offset is backed up once. Shadows created while ON get it
 # too (monitor). A shadow edited by hand while ON is left alone by later dial
 # moves, and keeps its hand-edited value when switching OFF; every other shadow
-# is restored to its backup on OFF. Linked overlays follow by themselves.
+# is restored to its backup on OFF.
+#
+# A STYLE change (Offset <-> Projected for objects, Simple <-> Realistic for
+# paths / walls / patterns) is not a hand edit: modules that expose
+# get_shadow_style() have their style recorded next to the applied offset, and
+# a shadow whose style changed is simply re-applied on the next pass.
+#
+# Distance is the pixel reach of the shadow tip for EVERY style: 50 px puts an
+# Offset shadow 50 px away and gives a Stretch / Extrude shadow a 50 px tip
+# (the object module maps proj_angle/proj_length onto the same vector).
+#
+# Overlays (objects, patterns): the global sun angle is imposed at render time
+# on every overlay — linked, unlinked and locked alike — through the modules'
+# set_global_sun(); their own settings are untouched and come back on OFF.
+# "Invert Overlays" lights them from the opposite side. Distance never applies
+# to overlays.
 #
 # One dial per asset type (Objects / Paths / Walls / Patterns / Roofs) plus
 # "All": moving the All dial copies its offset to every type; a type's dial
 # only drives that type. The menu picks which dial is shown.
 #
 # ModMapData:
-#   GlobalIllumination        {enabled, use_angle, use_distance, active,
+#   GlobalIllumination        {enabled, use_angle, use_distance, invert_overlays, active, range,
 #                              targets: {all|objects|paths|walls|patterns|roofs: [ox, oy]}}
 #   GlobalIlluminationBackup  {key: [ox, oy]}   offset before the override
 #   GlobalIlluminationApplied {key: [ox, oy]}   what the override last wrote (read back)
@@ -25,7 +40,9 @@ var global
 var core = null
 var logging_level = 0
 var shadow_history = null
-var modules = {}   # {"objects": m, "paths": m, "walls": m, "roofs": m, "patterns": m} (set by Core)
+# Set by Core: {"objects", "paths", "walls", "roofs", "patterns"} soft-shadow
+# modules + "overlays_objects" / "overlays_patterns" (set_global_sun API).
+var modules = {}
 
 const DATA_KEY = "GlobalIllumination"
 const BACKUP_KEY = "GlobalIlluminationBackup"
@@ -33,7 +50,10 @@ const APPLIED_KEY = "GlobalIlluminationApplied"
 const TYPES = ["objects", "paths", "walls", "patterns", "roofs"]
 const MENU = ["all", "objects", "paths", "walls", "patterns", "roofs"]
 const MENU_LABELS = ["All", "Objects", "Paths", "Walls", "Patterns", "Roofs"]
-const DEFAULTS = {"enabled": false, "use_angle": true, "use_distance": true, "active": "all"}
+const DEFAULTS = {"enabled": false, "use_angle": true, "use_distance": true, "invert_overlays": false, "active": "all", "range": 1.0}
+const RANGE_MAX = 10.0   # dial reach = range × OFFSET_MAX px (1 = 100 px, 10 = 1000 px)
+# overlay module key -> the dial (target type) that drives it
+const OVERLAY_MODULES = {"overlays_objects": "objects", "overlays_patterns": "patterns"}
 
 const OFFSET_MAX = 100.0
 const DIAL_SIZE = 90
@@ -71,6 +91,7 @@ func initialise() -> void:
 # modules restored their shadows).
 func apply_saved_shadows_to_map() -> void:
 	_sync_ui()
+	_push_overlay_suns()
 
 func _data() -> Dictionary:
 	if not global.ModMapData.has(DATA_KEY) or not (global.ModMapData[DATA_KEY] is Dictionary):
@@ -90,6 +111,10 @@ func _data() -> Dictionary:
 		if not d["targets"].has(t):
 			d["targets"][t] = [0.0, 0.0]
 	return d
+
+# Pixel reach of the dial edge (Range × 100 px).
+func _dial_max() -> float:
+	return clamp(float(_data().get("range", 1.0)), 1.0, RANGE_MAX) * OFFSET_MAX
 
 func _target_offset(type_name: String) -> Vector2:
 	var t = _data()["targets"][type_name]
@@ -183,6 +208,17 @@ func _same(a, b) -> bool:
 		return false
 	return abs(float(a[0]) - float(b[0])) < TOL and abs(float(a[1]) - float(b[1])) < TOL
 
+# Style tag of a shadow ("" when the module has none); stored as applied[key][2].
+func _style_of(entry) -> String:
+	if entry[1].has_method("get_shadow_style"):
+		var st = entry[1].get_shadow_style(entry[2])
+		return str(st) if st != null else ""
+	return ""
+
+# True when the shadow's style changed since GI last applied it.
+func _restyled(entry, applied_val) -> bool:
+	return applied_val.size() > 2 and str(applied_val[2]) != _style_of(entry)
+
 #########################################################################################################
 ## OVERRIDE LOGIC
 #########################################################################################################
@@ -208,6 +244,15 @@ func _target_for(cur: Array, type_name: String) -> Array:
 	var v2 = dir * g.length()
 	return [round(v2.x), round(v2.y)]
 
+# Public, for placement previews: the offset GI would give a shadow of
+# `type_name` whose current offset is `cur` ([ox, oy]), or null when GI is
+# off. Pure computation — nothing is written or backed up.
+func preview_offset(type_name: String, cur):
+	var d = _data()
+	if not d["enabled"] or cur == null or not d["targets"].has(type_name):
+		return null
+	return _target_for(cur, type_name)
+
 # Apply the override to every shadow not edited by hand since the last write.
 # `only_new` restricts to shadows never touched by the override (monitor).
 # Three passes: (1) read every current offset — the manual-edit test uses this
@@ -229,7 +274,7 @@ func _apply_all(only_new: bool = false) -> void:
 		if not cur_by_key.has(key):
 			continue
 		var cur = cur_by_key[key]
-		if applied.has(key):
+		if applied.has(key) and not _restyled(entry, applied[key]):
 			if only_new:
 				continue
 			if not _same(cur, applied[key]):
@@ -248,7 +293,7 @@ func _apply_all(only_new: bool = false) -> void:
 	for item in to_write:
 		var entry = item[0]
 		var stored = entry[1].get_shadow_offset(entry[2])
-		applied[entry[0]] = [stored[0], stored[1]] if stored != null else [item[1][0], item[1][1]]
+		applied[entry[0]] = [stored[0], stored[1], _style_of(entry)] if stored != null else [item[1][0], item[1][1], _style_of(entry)]
 		if DEBUG_APPLY:
 			outputlog("apply %s cur=%s target=%s stored=%s" % [entry[0], str(cur_by_key[entry[0]]), str(item[1]), str(stored)], 0)
 
@@ -267,7 +312,7 @@ func _restore_all() -> void:
 		var cur = m.get_shadow_offset(node)
 		if cur == null:
 			continue
-		if applied.has(key) and not _same(cur, applied[key]):
+		if applied.has(key) and not _restyled(by_key[key], applied[key]) and not _same(cur, applied[key]):
 			continue   # hand-edited while ON: keeps its value
 		var b = backup[key]
 		if not _same(cur, b):
@@ -278,6 +323,30 @@ func _restore_all() -> void:
 func _on_monitor_tick() -> void:
 	if _data()["enabled"]:
 		_apply_all(true)
+
+#########################################################################################################
+## OVERLAYS (render-time sun override, no per-overlay data)
+#########################################################################################################
+
+# World sun angle (deg, 0 = right / 90 = down) to impose on the overlays driven
+# by `type_name`'s dial, or null (off, angle not overridden, or dial at center).
+func _overlay_sun_for(type_name: String):
+	var d = _data()
+	if not d["enabled"] or not d["use_angle"]:
+		return null
+	var g = _target_offset(type_name)
+	if g.length() < 0.5:
+		return null
+	var sun = fposmod(rad2deg(atan2(-g.y, -g.x)), 360.0)
+	if d["invert_overlays"]:
+		sun = fposmod(sun + 180.0, 360.0)
+	return sun
+
+func _push_overlay_suns() -> void:
+	for mkey in OVERLAY_MODULES.keys():
+		var m = modules.get(mkey)
+		if m != null and m.has_method("set_global_sun"):
+			m.set_global_sun(_overlay_sun_for(OVERLAY_MODULES[mkey]))
 
 #########################################################################################################
 ## HISTORY
@@ -323,6 +392,7 @@ func history_apply(payload) -> void:
 		if cur != null and not _same(cur, offsets[key]):
 			entry[1].set_shadow_offset(entry[2], float(offsets[key][0]), float(offsets[key][1]))
 	_sync_ui()
+	_push_overlay_suns()
 
 #########################################################################################################
 ## UI (built into the Soft Shadows tool panel)
@@ -374,6 +444,21 @@ func build_controls(container) -> void:
 	ui["use_distance"] = cb_d
 	panel.add_child(frow)
 
+	# Overlays: lit from the global sun, optionally from the opposite side.
+	var orow = HBoxContainer.new()
+	var ol = Label.new()
+	ol.text = "Overlays"
+	ol.rect_min_size.x = 70
+	orow.add_child(ol)
+	var cb_i = CheckBox.new()
+	cb_i.text = "Invert"
+	cb_i.hint_tooltip = "Overlay shadows follow the global sun (angle only). Invert lights them from the opposite side."
+	cb_i.focus_mode = Control.FOCUS_NONE
+	cb_i.connect("toggled", self, "_on_invert_toggled")
+	orow.add_child(cb_i)
+	ui["invert_overlays"] = cb_i
+	panel.add_child(orow)
+
 	# Which dial is shown: All (drives every type) or one asset type.
 	var mrow = HBoxContainer.new()
 	var ml = Label.new()
@@ -400,6 +485,8 @@ func build_controls(container) -> void:
 	dist_spin.min_value = 0
 	dist_spin.max_value = OFFSET_MAX
 	dist_spin.step = 1
+	dist_spin.suffix = " px"
+	dist_spin.hint_tooltip = "Pixel reach of the shadow tip, whatever the style: an Offset shadow is moved this far, a Stretch / Extrude one is projected this far."
 	dist_spin.rect_min_size.x = 85
 	dist_spin.connect("value_changed", self, "_on_spin_changed")
 	header.add_child(dist_spin)
@@ -424,6 +511,34 @@ func build_controls(container) -> void:
 	header.add_child(rb)
 	panel.add_child(header)
 
+	# Range: [Label] [Slider] [SpinBox] — dial reach = Range × 100 px
+	var rrow = HBoxContainer.new()
+	var rl = Label.new()
+	rl.text = "Max Distance"
+	rl.rect_min_size.x = 85
+	rrow.add_child(rl)
+	var range_slider = HSlider.new()
+	range_slider.min_value = 1
+	range_slider.max_value = RANGE_MAX
+	range_slider.step = 1
+	range_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	range_slider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	range_slider.focus_mode = Control.FOCUS_NONE
+	range_slider.connect("value_changed", self, "_on_range_changed")
+	rrow.add_child(range_slider)
+	ui["range_slider"] = range_slider
+	var range_spin = SpinBox.new()
+	range_spin.min_value = 1
+	range_spin.max_value = RANGE_MAX
+	range_spin.step = 1
+	range_spin.suffix = "x"
+	range_spin.hint_tooltip = "Dial reach: 1 = 100 px, 10 = 1000 px. Only widens the dial, the current sun keeps its value."
+	range_spin.rect_min_size.x = 60
+	range_spin.connect("value_changed", self, "_on_range_changed")
+	rrow.add_child(range_spin)
+	ui["range_spin"] = range_spin
+	panel.add_child(rrow)
+
 	var cc = CenterContainer.new()
 	cc.rect_clip_content = false
 	var mc = MarginContainer.new()
@@ -447,6 +562,11 @@ func _sync_ui() -> void:
 	ui["panel"].visible = d["enabled"]
 	ui["use_angle"].pressed = d["use_angle"]
 	ui["use_distance"].pressed = d["use_distance"]
+	ui["invert_overlays"].pressed = d["invert_overlays"]
+	var rv = clamp(float(d.get("range", 1.0)), 1.0, RANGE_MAX)
+	ui["range_spin"].value = rv
+	ui["range_slider"].value = rv
+	ui["dist_spin"].max_value = _dial_max()
 	ui["menu"].selected = max(MENU.find(d["active"]), 0)
 	var t = _target_offset(d["active"])
 	_set_dial_from_xy(t.x, t.y)
@@ -493,6 +613,7 @@ func _on_enable_toggled(pressed: bool) -> void:
 		_apply_all()
 	else:
 		_restore_all()
+	_push_overlay_suns()
 	_txn_end("global illumination " + ("on" if pressed else "off"))
 
 func _on_flag_toggled(pressed: bool, key: String) -> void:
@@ -509,7 +630,16 @@ func _on_flag_toggled(pressed: bool, key: String) -> void:
 	d[key] = pressed
 	if d["enabled"]:
 		_apply_all()
+	_push_overlay_suns()
 	_txn_end("global illumination " + key)
+
+func _on_invert_toggled(pressed: bool) -> void:
+	if _syncing:
+		return
+	_txn_begin()
+	_data()["invert_overlays"] = pressed
+	_push_overlay_suns()
+	_txn_end("global illumination invert overlays")
 
 func _on_spin_changed(_v) -> void:
 	if _syncing:
@@ -526,6 +656,30 @@ func _on_spin_changed(_v) -> void:
 	_txn_begin()
 	_commit_offset(round(-sin(a) * dist), round(cos(a) * dist))
 	_txn_end("global illumination sun")
+
+# Range only rescales the dial; the current sun keeps its px value (clamped
+# to the new reach if the range shrinks below it).
+func _on_range_changed(v) -> void:
+	if _syncing:
+		return
+	var rv = clamp(float(v), 1.0, RANGE_MAX)
+	if rv == float(_data().get("range", 1.0)):
+		return
+	_txn_begin()
+	_data()["range"] = rv
+	var dmax = _dial_max()
+	_syncing = true
+	ui["range_slider"].value = rv
+	ui["range_spin"].value = rv
+	ui["dist_spin"].max_value = dmax
+	_syncing = false
+	var g = _target_offset(_data()["active"])
+	if g.length() > dmax:
+		g = g.normalized() * dmax
+		_commit_offset(round(g.x), round(g.y))
+	else:
+		_set_dial_from_xy(g.x, g.y)
+	_txn_end("global illumination range")
 
 func _on_reset() -> void:
 	_deactivate_snaps()
@@ -545,6 +699,7 @@ func _commit_offset(ox: float, oy: float) -> void:
 	_set_dial_from_xy(ox, oy)
 	if d["enabled"]:
 		_apply_all()
+	_push_overlay_suns()
 
 #########################################################################################################
 ## DIAL (same widget as the other tools: handle = sun, non-linear radius)
@@ -683,7 +838,8 @@ func _update_dial_from_mouse(pos: Vector2, dial: Control) -> void:
 		frac = 0.0 if proj <= 0.0 else min(proj, radius) / radius
 		direction = sd
 	# Handle = sun direction, shadow offset = opposite; quadratic radius.
-	_commit_offset(round(-direction.x * frac * frac * OFFSET_MAX), round(-direction.y * frac * frac * OFFSET_MAX))
+	var dmax = _dial_max()
+	_commit_offset(round(-direction.x * frac * frac * dmax), round(-direction.y * frac * frac * dmax))
 
 func _on_snap_toggled(pressed: bool, key: String, angle: float) -> void:
 	var dial = ui.get("dial")
@@ -720,7 +876,7 @@ func _set_dial_from_xy(ox: float, oy: float) -> void:
 	ui["angle_spin"].value = round(angle)
 	ui["dist_spin"].value = round(dist)
 	var radius = DIAL_SIZE / 2.0
-	var frac = clamp(dist / OFFSET_MAX, 0.0, 1.0)   # handle linear in the value
+	var frac = clamp(dist / _dial_max(), 0.0, 1.0)   # handle linear in the value
 	var direction = Vector2(-ox, -oy).normalized() if dist > 0.5 else Vector2.ZERO
 	var p = Vector2(radius, radius) + direction * frac * radius
 	ui["dial_dot"].rect_position = Vector2(p.x - 5, p.y - 5)
