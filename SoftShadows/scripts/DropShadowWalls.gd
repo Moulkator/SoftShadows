@@ -4246,6 +4246,8 @@ func _update_crop_blur_visibility():
 		ui_config["crop_ends_hbox"].visible = realistic
 
 func _set_render_mode_buttons(active_index: int):
+	# Remembered so re-clicking the active mode does not swap opacities.
+	ui_config["mode_current"] = active_index
 	for i in range(2):
 		if not ui_config.has("mode_btn_" + str(i)):
 			continue
@@ -4281,7 +4283,10 @@ func _on_wall_render_mode_pressed(mode_index):
 	_syncing_ui = true
 	# Opacité indépendante : échange le slider avec la valeur du mode inactif (max d'abord
 	# pour ne pas clamper une valeur realistic >1 en passant par un max simple).
-	if ui_config.has("opacity_slider"):
+	var _prev_mode = int(ui_config.get("mode_current", _render_mode_to_index(DEFAULT_SHADOW_CONFIG.get("render_mode", "simple"))))
+	# Only swap opacities on an actual mode change (re-clicking the active mode
+	# used to swap them every time, toggling the shadow darker/lighter).
+	if mode_index != _prev_mode and ui_config.has("opacity_slider"):
 		var _cur = ui_config["opacity_slider"].value
 		var _oth = ui_config.get("opacity_inactive", DEFAULT_SHADOW_CONFIG.get("opacity_realistic", DEFAULT_SHADOW_CONFIG["opacity"]))
 		ui_config["opacity_inactive"] = _cur

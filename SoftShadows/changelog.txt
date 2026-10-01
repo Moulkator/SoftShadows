@@ -1,5 +1,8 @@
 SOFT SHADOWS
 
+v1.7.3
+- Fixed a bug when you selected twice the same shadow mode for walls or paths (Simple or Realistic) causing the shadow to become darker or lighter
+
 v1.7.2
 - Fixed a bug affecting multiselection
 - Fixed a bug with the wall shadows not being the same in the wall tool and the selection tool in Realistic mode
