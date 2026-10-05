@@ -4,9 +4,11 @@
 ##
 #########################################################################################################
 # Version 1.0.0
-# A self-shadow that sits ON TOP of an asset, clipped to its silhouette, darkening
-# only the side facing away from the sun. Reuses the same per-object child-sprite
-# pattern as DropShadowObjects but with a trivial shader (no blur, no raycast).
+# A self-shadow that sits ON TOP of an asset, clipped to its silhouette. Reuses
+# the same per-object child-sprite pattern as DropShadowObjects. Two modes:
+#   - "gradient": darkens only the side facing away from the sun (trivial shader)
+#   - "bevel":    a shadow band along the silhouette's edges, like the pattern
+#                 overlay (dial at the center = sun from above = every edge)
 
 var global
 var core = null
@@ -20,14 +22,28 @@ const DEFAULTS = {
 	"enabled": false,
 	"opacity": 0.5,
 	"sun_angle": 90.0,   # degrees, WORLD space (LOCAL/texture space when lock_sun)
-	"coverage": 0.5,
+	"coverage": 0.25,   # bevel: band width (x COVERAGE_MAX_PX) / gradient: reach across the asset (its own default: GRADIENT_COVERAGE)
 	"diffusion": 0.5,
 	"curve": 0.0,
 	"shadow_color": Color(0, 0, 0, 1),
 	"link_sun": true,   # follow the soft (drop) shadow's sun angle (on by default)
 	"lock_sun": false,  # sun angle is LOCAL to the asset texture (follows its rotation)
-	"ignore_transparency": false  # replace-color mode for semi-transparent pixels
+	"ignore_transparency": false,  # replace-color mode for semi-transparent pixels
+	"mode": "bevel",        # "gradient" (terminator across the asset) / "bevel" (band along the silhouette)
+	"sun_strength": 0.0,    # bevel only — "Distance" on the dial: 0 = sun from above (every edge), 1 = fully directional
+	"relief": "raised"      # bevel only — "raised": edges away from the sun are shaded / "lowered": edges facing it
 }
+const MODES = ["gradient", "bevel"]
+# Retro-compat: overlays saved before the Bevel mode existed carry no "mode"
+# key and ARE gradient overlays. Only brand new overlays default to bevel.
+const LEGACY_MODE = "gradient"
+const GRADIENT_COVERAGE = 0.5   # default Coverage in gradient mode
+const RELIEFS = ["raised", "lowered"]
+const SLIDER_KEYS = ["coverage", "diffusion", "curve", "opacity"]
+const COVERAGE_MAX_PX = 256.0   # bevel: coverage 1.0 = band of 256 world px
+const SOFT_OFFSET_MAX = 100.0   # DropShadowObjects.OFFSET_MAX (dial radius at Range 1)
+const DIAL_SIZE = 90
+const SNAP_KEYS = ["snap_45", "snap_135", "snap_225", "snap_315"]
 
 var _shader: Shader = null
 # World sun angle (deg, 0 = right / 90 = down) imposed by Global Illumination on
@@ -98,7 +114,7 @@ func initialise() -> void:
 	if shadow_history != null and shadow_history.has_method("register_flusher"):
 		shadow_history.register_flusher(self, "_history_flush")
 
-	outputlog("Overlay Shadow Objects initialised. [BUILD: OVERLAY-CMTMERGE-4]", 0)
+	outputlog("Overlay Shadow Objects initialised. [BUILD: OVERLAY-BEVEL-2]", 0)
 
 #########################################################################################################
 ## NODE HELPERS
@@ -265,12 +281,15 @@ func _apply_params(ov, cfg: Dictionary, rot: float) -> void:
 	# Express the world sun direction in the sprite's local space so rotation and
 	# mirror (negative scale) are both handled. Stored as meta for the per-frame sync.
 	var sun_deg = cfg.get("sun_angle", DEFAULTS["sun_angle"])
+	var strength = clamp(float(cfg.get("sun_strength", DEFAULTS["sun_strength"])), 0.0, 1.0)
 	if cfg.get("link_sun", false):
 		var lobj = ov.get_parent()
 		if lobj != null and lobj.has_meta("node_id"):
-			var lsun = _linked_sun_angle(str(lobj.get_meta("node_id")))
-			if lsun != null:
-				sun_deg = lsun
+			var ls = _linked_sun(str(lobj.get_meta("node_id")))
+			if ls != null:
+				if ls[0] != null:
+					sun_deg = ls[0]
+				strength = ls[1]
 	var sun_rad = deg2rad(sun_deg)
 	var sun_vec = Vector2(cos(sun_rad), sin(sun_rad))
 	var local_sun
@@ -299,8 +318,24 @@ func _apply_params(ov, cfg: Dictionary, rot: float) -> void:
 	mat.set_shader_param("ovr_curve", cfg.get("curve", DEFAULTS["curve"]))
 	mat.set_shader_param("ovr_local_sun", local_sun)
 	mat.set_shader_param("ovr_tex_size", size)
+	# Bevel mode params (plain + ovr_ mirror, same reason as above).
+	var bevel = {
+		"overlay_mode": 1.0 if cfg.get("mode", LEGACY_MODE) == "bevel" else 0.0,
+		"band_px": float(cfg.get("coverage", DEFAULTS["coverage"])) * COVERAGE_MAX_PX,
+		"sun_strength": strength,
+		"raised": 1.0 if cfg.get("relief", DEFAULTS["relief"]) == "raised" else 0.0,
+		"px_scale": _px_scale(ov)
+	}
+	for bk in bevel.keys():
+		mat.set_shader_param(bk, bevel[bk])
+		mat.set_shader_param("ovr_" + bk, bevel[bk])
 	# Free Transform warp (no-op when the parent asset isn't distorted).
 	_apply_ft_warp_params(ov, ov.get_parent())
+
+func _px_scale(ov) -> Vector2:
+	# World px per texel of the overlay sprite (bevel band width is in world px).
+	var xf = ov.global_transform
+	return Vector2(max(xf.x.length(), 0.0001), max(xf.y.length(), 0.0001))
 
 func remove_shadow(obj) -> void:
 	if obj == null or not is_instance_valid(obj):
@@ -343,6 +378,56 @@ uniform float ovr_diffusion = 0.5;
 uniform float ovr_curve = 0.0;
 uniform vec2 ovr_local_sun = vec2(0.0, 1.0);
 uniform vec2 ovr_tex_size = vec2(1.0, 1.0);
+uniform float ovr_overlay_mode = 0.0;
+uniform float ovr_band_px = 64.0;
+uniform vec2 ovr_px_scale = vec2(1.0, 1.0);
+uniform float ovr_sun_strength = 0.0;
+uniform float ovr_raised = 1.0;
+
+// Bevel band: same search as OverlayShadowObject.shader (bevel_shade).
+float ovr_bevel_alpha(sampler2D tex, vec2 uv) {
+	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 0.0;
+	return texture(tex, uv).a;
+}
+float ovr_bevel_shade(sampler2D tex, vec2 uv, vec2 texel) {
+	if (ovr_band_px < 0.01) return 0.0;
+	vec2 sun = ovr_local_sun * ovr_px_scale;
+	float sl = length(sun);
+	sun = sl > 0.00001 ? sun / sl : vec2(0.0, 1.0);
+	if (ovr_raised > 0.5) sun = -sun;
+	vec2 to_uv = texel / ovr_px_scale;
+	float band_in = clamp(1.0 - ovr_diffusion, 0.0, 0.999);
+	float k = pow(2.0, ovr_curve);
+	float step_len = ovr_band_px / 10.0;
+	float best = 0.0;
+	for (int i = 0; i < 16; i++) {
+		float ang = float(i) * 0.39269908;
+		vec2 d = vec2(cos(ang), sin(ang));
+		float w = mix(1.0, max(dot(d, sun), 0.0), ovr_sun_strength);
+		if (w > 0.0) {
+			float lo = 0.0;
+			float hi = -1.0;
+			for (int s = 1; s <= 10; s++) {
+				float r = step_len * float(s);
+				float a = ovr_bevel_alpha(tex, uv + d * r * to_uv);
+				if (hi < 0.0) {
+					if (a < 0.2) { hi = r; } else { lo = r; }
+				}
+			}
+			if (hi > 0.0) {
+				for (int b = 0; b < 4; b++) {
+					float mid = 0.5 * (lo + hi);
+					if (ovr_bevel_alpha(tex, uv + d * mid * to_uv) < 0.2) { hi = mid; } else { lo = mid; }
+				}
+				float u = 0.5 * (lo + hi) / ovr_band_px;
+				float f = 1.0 - smoothstep(band_in, 1.0, u);
+				f = pow(max(f, 0.0), k);
+				best = max(best, w * f);
+			}
+		}
+	}
+	return best;
+}
 """
 
 # Injected right before fragment()'s closing brace: same terminator math as
@@ -365,6 +450,11 @@ __OVR_POS__
 	float ovr_thr = mix(ovr_hi, ovr_lo, ovr_coverage);
 	float ovr_w = max(ovr_diffusion * 0.5, 0.002);
 	float ovr_t = smoothstep(ovr_thr - ovr_w, ovr_thr + ovr_w, ovr_proj);
+	if (ovr_overlay_mode > 0.5) {
+		// Bevel mode. Runs in plain UV space: with a fused FT warp + tint
+		// material the band follows the UN-warped silhouette.
+		ovr_t = ovr_bevel_shade(TEXTURE, UV, TEXTURE_PIXEL_SIZE);
+	}
 	COLOR.rgb = mix(COLOR.rgb, ovr_shadow_color.rgb, ovr_opacity * ovr_t);
 	}
 """
@@ -480,7 +570,8 @@ func _ovr_apply_merged(ov, src_mat) -> bool:
 		if v != null:
 			merged.set_shader_param(pname, v)
 	# Copy OUR shadow params from the plain overlay material, prefixed.
-	for p in ["shadow_color", "opacity", "coverage", "diffusion", "curve", "local_sun", "tex_size"]:
+	for p in ["shadow_color", "opacity", "coverage", "diffusion", "curve", "local_sun", "tex_size",
+			"overlay_mode", "band_px", "px_scale", "sun_strength", "raised"]:
 		var pv = plain.get_shader_param(p)
 		if pv != null:
 			merged.set_shader_param("ovr_" + p, pv)
@@ -598,27 +689,27 @@ func _on_frame_pre_draw() -> void:
 				# Global Illumination overrides link AND lock (world sun).
 				var gr = deg2rad(_global_sun)
 				ws = Vector2(cos(gr), sin(gr))
-				if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("sun_angle_slider"):
-					_syncing = true
-					ui["sun_angle_slider"].value = round(_global_sun)
-					ui["sun_angle_spin"].value = round(_global_sun)
-					_syncing = false
+				if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("dial"):
+					_set_dial(round(_global_sun), ui["strength_spin"].value / 100.0)
 			elif obj != null and obj.has_meta("_overlay_config"):
 				var ocfg = obj.get_meta("_overlay_config")
 				if ocfg is Dictionary and ocfg.get("lock_sun", false):
 					locked = true
 				elif ocfg is Dictionary and ocfg.get("link_sun", false):
-					var lsun = _linked_sun_angle(nid)
-					if lsun != null:
+					var ls = _linked_sun(nid)
+					if ls != null:
+						# Angle: null while the soft shadow has no direction
+						# (zero offset) -> the overlay keeps its own angle.
+						var lsun = ls[0] if ls[0] != null else float(ocfg.get("sun_angle", DEFAULTS["sun_angle"]))
 						var lr = deg2rad(lsun)
 						ws = Vector2(cos(lr), sin(lr))
 						ov.set_meta("_world_sun", ws)
-						# Reflect the live linked angle in the UI of the selected object.
-						if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("sun_angle_slider"):
-							_syncing = true
-							ui["sun_angle_slider"].value = round(lsun)
-							ui["sun_angle_spin"].value = round(lsun)
-							_syncing = false
+						# Distance (bevel directionality) follows the soft shadow too.
+						ov.material.set_shader_param("sun_strength", ls[1])
+						ov.material.set_shader_param("ovr_sun_strength", ls[1])
+						# Reflect the live linked sun in the UI of the selected object.
+						if _monitored != null and is_instance_valid(_monitored) and _monitored == obj and ui.has("dial") and ui["link_sun"].pressed:
+							_set_dial(round(lsun), ls[1])
 			var live_ls
 			if locked:
 				# Locked to the texture: no world -> local conversion needed.
@@ -627,6 +718,10 @@ func _on_frame_pre_draw() -> void:
 				live_ls = ov.global_transform.affine_inverse().basis_xform(ws)
 			ov.material.set_shader_param("local_sun", live_ls)
 			ov.material.set_shader_param("ovr_local_sun", live_ls)
+			# Bevel band is in world px: follow the asset's live scale.
+			var pxs = _px_scale(ov)
+			ov.material.set_shader_param("px_scale", pxs)
+			ov.material.set_shader_param("ovr_px_scale", pxs)
 	for nid in dead:
 		_active.erase(nid)
 
@@ -887,46 +982,115 @@ func build_ui() -> void:
 	sp.visible = false
 	ui["panel"] = sp
 
-	# Sun ° row with a "link to soft shadow sun angle" toggle.
+	# Style dropdown: Gradient = terminator across the asset, Bevel = band
+	# along the silhouette.
+	var mrow = HBoxContainer.new()
+	var ml = Label.new()
+	ml.text = "Style"
+	ml.rect_min_size.x = 70
+	mrow.add_child(ml)
+	var mode_opt = OptionButton.new()
+	mode_opt.add_item("Gradient", 0)
+	mode_opt.add_item("Bevel", 1)
+	mode_opt.hint_tooltip = "Gradient: a shadow gradient sweeps across the asset, away from the sun\nBevel: a shadow band follows the asset's edges (dial at the center = sun from above: every edge)"
+	mode_opt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	mode_opt.connect("item_selected", self, "_on_mode_selected")
+	mrow.add_child(mode_opt)
+	ui["mode_opt"] = mode_opt
+	sp.add_child(mrow)
+
+	# Relief buttons (bevel only), same as the pattern overlay.
+	var rrow = HBoxContainer.new()
+	var relief_names = ["Raised", "Lowered"]
+	var relief_tips = ["The asset is a bump / dome: the edges away from the sun are in shadow",
+		"The asset is a hollow: its rim shades the edges facing the sun"]
+	for i in range(2):
+		var rbtn = Button.new()
+		rbtn.text = " " + relief_names[i]
+		rbtn.hint_tooltip = relief_tips[i]
+		rbtn.toggle_mode = true
+		rbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		rbtn.align = Button.ALIGN_CENTER
+		rbtn.focus_mode = Control.FOCUS_NONE
+		rbtn.connect("pressed", self, "_on_relief_pressed", [i])
+		rrow.add_child(rbtn)
+		ui["relief_btn_" + str(i)] = rbtn
+	sp.add_child(rrow)
+	ui["relief_row"] = rrow
+
+	# Sun dial header: Distance [spin %]  Angle [spin °]  [reset]
+	# Dial: handle = sun direction. Bevel: distance from the center =
+	# directionality (center = sun from above, rim = fully directional), same
+	# non-linear radius as the soft shadow dial. Gradient: angle only (the
+	# handle stays on the rim, Distance is hidden).
 	var sun_row = HBoxContainer.new()
-	var sun_l = Label.new()
-	sun_l.text = "Sun °"
-	sun_l.rect_min_size.x = 70
-	sun_row.add_child(sun_l)
-	var sun_s = HSlider.new()
-	sun_s.min_value = 0
-	sun_s.max_value = 359
-	sun_s.step = 1
-	sun_s.value = DEFAULTS["sun_angle"]
-	sun_s.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	sun_s.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	sun_s.connect("value_changed", self, "_on_slider", ["sun_angle"])
-	sun_row.add_child(sun_s)
-	ui["sun_angle_slider"] = sun_s
-	var sun_sb = SpinBox.new()
-	sun_sb.min_value = 0
-	sun_sb.max_value = 359
-	sun_sb.step = 1
-	sun_sb.value = DEFAULTS["sun_angle"]
-	sun_sb.connect("value_changed", self, "_on_spin", ["sun_angle"])
-	sun_row.add_child(sun_sb)
-	ui["sun_angle_spin"] = sun_sb
-	var sun_rb = _make_icon_button("icons/reset.png", "Reset Sun °", 0.5)
-	sun_rb.connect("pressed", self, "_on_single_reset", ["sun_angle"])
+	var sl = Label.new()
+	sl.text = "Distance"
+	sun_row.add_child(sl)
+	ui["strength_label"] = sl
+	var strength_spin = SpinBox.new()
+	strength_spin.min_value = 0
+	strength_spin.max_value = 100
+	strength_spin.step = 1
+	strength_spin.suffix = "%"
+	strength_spin.value = DEFAULTS["sun_strength"] * 100.0
+	strength_spin.rect_min_size.x = 80
+	strength_spin.connect("value_changed", self, "_on_sun_spin_changed")
+	sun_row.add_child(strength_spin)
+	ui["strength_spin"] = strength_spin
+	var angle_l = Label.new()
+	angle_l.text = "Angle"
+	sun_row.add_child(angle_l)
+	var angle_spin = SpinBox.new()
+	angle_spin.min_value = 0
+	angle_spin.max_value = 359
+	angle_spin.step = 1
+	angle_spin.suffix = "°"
+	angle_spin.value = _spin_from_world(DEFAULTS["sun_angle"])
+	angle_spin.rect_min_size.x = 72
+	angle_spin.connect("value_changed", self, "_on_sun_spin_changed")
+	sun_row.add_child(angle_spin)
+	ui["angle_spin"] = angle_spin
+	var spacer = Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sun_row.add_child(spacer)
+	var sun_rb = _make_icon_button("icons/reset.png", "Reset sun", 0.5)
+	sun_rb.connect("pressed", self, "_on_single_reset", ["sun"])
 	sun_row.add_child(sun_rb)
-	var link_btn = _make_icon_button("icons/link.png", "Link to the soft shadow's sun angle", 0.5)
+	sp.add_child(sun_row)
+
+	# Link / Lock sit beside the dial.
+	var side = VBoxContainer.new()
+	side.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	var link_btn = _make_icon_button("icons/link.png", "Link to the soft shadow's sun", 0.5)
 	link_btn.toggle_mode = true
 	link_btn.pressed = DEFAULTS["link_sun"]
 	link_btn.connect("toggled", self, "_on_link_toggled")
-	sun_row.add_child(link_btn)
+	side.add_child(link_btn)
 	ui["link_sun"] = link_btn
 	var lock_btn = _make_icon_button("icons/lock.png", "Lock the sun angle to the asset texture (follows its rotation)", 0.5)
 	lock_btn.toggle_mode = true
 	lock_btn.pressed = DEFAULTS["lock_sun"]
 	lock_btn.connect("toggled", self, "_on_lock_toggled")
-	sun_row.add_child(lock_btn)
+	side.add_child(lock_btn)
 	ui["lock_sun"] = lock_btn
-	sp.add_child(sun_row)
+
+	var cc = CenterContainer.new()
+	cc.rect_clip_content = false
+	var dial_row = HBoxContainer.new()
+	dial_row.add_constant_override("separation", 12)
+	var mc = MarginContainer.new()
+	mc.rect_clip_content = false
+	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
+		mc.add_constant_override(m, 8)
+	mc.add_child(_create_dial())
+	dial_row.add_child(mc)
+	dial_row.add_child(side)
+	cc.add_child(dial_row)
+	sp.add_child(cc)
+	_set_mode_ui(MODES.find(DEFAULTS["mode"]))
+	_set_relief_buttons(0)
+	_set_dial(DEFAULTS["sun_angle"], DEFAULTS["sun_strength"])
 	_update_link_enabled(DEFAULTS["link_sun"])
 
 	_add_slider(sp, "Coverage", "coverage", 0.0, 1.0, 0.01)
@@ -1026,6 +1190,308 @@ func _add_slider(parent, label: String, key: String, mn, mx, step) -> void:
 	parent.add_child(row)
 
 #########################################################################################################
+## UI — MODE / RELIEF BUTTONS
+#########################################################################################################
+
+func _is_bevel_ui() -> bool:
+	return ui.has("mode_opt") and ui["mode_opt"].selected == 1
+
+func _set_mode_ui(idx: int) -> void:
+	ui["mode_opt"].select(idx)   # select() does not emit item_selected
+	# Relief + Distance only make sense in bevel mode.
+	var bevel = idx == 1
+	if ui.has("relief_row"):
+		ui["relief_row"].visible = bevel
+	if ui.has("strength_spin"):
+		ui["strength_label"].visible = bevel
+		ui["strength_spin"].visible = bevel
+	# The handle sits on the rim in gradient mode: re-place it.
+	if ui.has("dial"):
+		_set_dial(_world_from_spin(ui["angle_spin"].value), ui["strength_spin"].value / 100.0)
+
+func _set_relief_buttons(idx: int) -> void:
+	for i in range(2):
+		var b = ui["relief_btn_" + str(i)]
+		b.pressed = (i == idx)
+		b.icon = b.get_icon("radio_checked" if i == idx else "radio_unchecked", "CheckBox")
+
+func _on_mode_selected(idx: int) -> void:
+	_set_mode_ui(idx)
+	if _syncing:
+		return
+	apply_to_selected(false, ["mode"])
+
+# Default of a slider key for the mode currently shown (Coverage means two
+# different things in the two modes).
+func _default_for(key: String):
+	if key == "coverage" and not _is_bevel_ui():
+		return GRADIENT_COVERAGE
+	return DEFAULTS[key]
+
+func _on_relief_pressed(idx: int) -> void:
+	_set_relief_buttons(idx)
+	if _syncing:
+		return
+	apply_to_selected(false, ["relief"])
+
+#########################################################################################################
+## UI — SUN DIAL (handle = sun direction; bevel: radius = directionality)
+#########################################################################################################
+
+# The Angle spin shows the same convention as the Soft Shadow dial (0° = sun at
+# noon / top, 90° = right, clockwise). Internally sun_angle stays in world
+# degrees (0 = right, 90 = down): displayed = world + 90.
+func _spin_from_world(world_deg: float) -> float:
+	return fposmod(world_deg + 90.0, 360.0)
+
+func _world_from_spin(spin_deg: float) -> float:
+	return fposmod(spin_deg - 90.0, 360.0)
+
+func _make_circle_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			img.set_pixel(x, y, color if Vector2(x, y).distance_to(center) <= radius else Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+func _make_ring_texture(size: int, color: Color) -> ImageTexture:
+	var img = Image.new()
+	img.create(size, size, false, Image.FORMAT_RGBA8)
+	img.lock()
+	var center = Vector2(size / 2.0, size / 2.0)
+	var radius = size / 2.0
+	for y in range(size):
+		for x in range(size):
+			img.set_pixel(x, y, color if abs(Vector2(x, y).distance_to(center) - radius) < 1.0 else Color(0, 0, 0, 0))
+	img.unlock()
+	var tex = ImageTexture.new()
+	tex.create_from_image(img, 0)
+	return tex
+
+func _create_dial() -> Control:
+	var size = DIAL_SIZE
+	var dial = Control.new()
+	dial.name = "SunDial"
+	dial.rect_min_size = Vector2(size, size)
+	dial.rect_size = Vector2(size, size)
+	dial.rect_clip_content = false
+	var bg = TextureRect.new()
+	bg.texture = _make_circle_texture(size, Color(0.12, 0.12, 0.12, 1.0))
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(bg)
+	for ring_frac in [0.25, 0.5, 0.75]:
+		var rs = int(size * ring_frac)
+		var ring = TextureRect.new()
+		ring.texture = _make_ring_texture(rs, Color(0.22, 0.22, 0.22, 1.0))
+		ring.rect_position = Vector2((size - rs) / 2.0, (size - rs) / 2.0)
+		ring.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		dial.add_child(ring)
+	for diag in [45.0, 135.0, 225.0, 315.0]:
+		var dr = deg2rad(diag)
+		for d in range(4, int(size / 2.0 - 2.0), 3):
+			var dot_line = ColorRect.new()
+			dot_line.color = Color(0.20, 0.20, 0.20, 0.5)
+			dot_line.rect_min_size = Vector2(1, 1)
+			dot_line.rect_position = Vector2(size / 2.0 + cos(dr) * d, size / 2.0 + sin(dr) * d)
+			dot_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			dial.add_child(dot_line)
+	var h_line = ColorRect.new()
+	h_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	h_line.rect_position = Vector2(0, size / 2.0 - 0.5)
+	h_line.rect_min_size = Vector2(size, 1)
+	h_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(h_line)
+	var v_line = ColorRect.new()
+	v_line.color = Color(0.25, 0.25, 0.25, 0.6)
+	v_line.rect_position = Vector2(size / 2.0 - 0.5, 0)
+	v_line.rect_min_size = Vector2(1, size)
+	v_line.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(v_line)
+	var center_dot = ColorRect.new()
+	center_dot.color = Color(0.4, 0.4, 0.4, 1.0)
+	center_dot.rect_min_size = Vector2(3, 3)
+	center_dot.rect_position = Vector2(size / 2.0 - 1.5, size / 2.0 - 1.5)
+	center_dot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(center_dot)
+	var snap_pos = {
+		"snap_315": Vector2(size - 8, -4),
+		"snap_45": Vector2(size - 8, size - 8),
+		"snap_135": Vector2(-4, size - 8),
+		"snap_225": Vector2(-4, -4)}
+	var snap_deg = {"snap_315": 315.0, "snap_45": 45.0, "snap_135": 135.0, "snap_225": 225.0}
+	var snap_tip = {"snap_315": "Sun NE", "snap_45": "Sun SE", "snap_135": "Sun SW", "snap_225": "Sun NW"}
+	for key in SNAP_KEYS:
+		var b = TextureButton.new()
+		b.name = key
+		b.texture_normal = _make_circle_texture(12, Color(0.3, 0.3, 0.3, 0.8))
+		b.texture_pressed = _make_circle_texture(12, Color(0.353, 0.698, 1.0, 1.0))
+		b.toggle_mode = true
+		b.rect_position = snap_pos[key]
+		b.rect_min_size = Vector2(12, 12)
+		b.hint_tooltip = snap_tip[key]
+		b.connect("toggled", self, "_on_snap_toggled", [key, snap_deg[key]])
+		dial.add_child(b)
+		ui[key] = b
+	var handle = ColorRect.new()
+	handle.name = "Handle"
+	handle.color = Color(0.95, 0.6, 0.1, 1.0)
+	handle.rect_min_size = Vector2(10, 10)
+	handle.rect_position = Vector2(size / 2.0 - 5, size / 2.0 - 5)
+	handle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	dial.add_child(handle)
+	dial.set_meta("dragging", false)
+	dial.set_meta("snap_angle", -1.0)
+	dial.connect("gui_input", self, "_on_dial_input", [dial])
+	ui["dial"] = dial
+	ui["dial_dot"] = handle
+	return dial
+
+func _soft_module():
+	return core.get("dropshadow_objects") if core != null else null
+
+# A sun edit made on the overlay's dial / spins. Linked and the object has a
+# soft shadow: the link is two-way, so the soft shadow's dial is driven (same
+# handle position; angle only in gradient mode) and the overlay follows it.
+# Otherwise (no soft shadow to drive) a hand edit breaks the link.
+func _commit_sun(angle: float, strength: float) -> void:
+	var driven = false
+	if ui["link_sun"].pressed and _monitored != null and is_instance_valid(_monitored):
+		var soft = _soft_module()
+		if soft != null and soft.has_method("overlay_drive_sun"):
+			driven = soft.overlay_drive_sun(_monitored, angle, strength, not _is_bevel_ui())
+	if not driven:
+		_unlink()
+	_set_dial(angle, strength)
+	# Driven: the soft shadow module records the undo step; our own copy of
+	# the sun is saved silently (used when the soft shadow has no direction,
+	# and once unlinked).
+	var was = _history_suspend
+	if driven:
+		_history_suspend = true
+	apply_to_selected(false, ["sun_angle", "sun_strength", "link_sun"])
+	_history_suspend = was
+
+func get_link_state(node):
+	# null = no overlay shadow on this object; else whether its sun is linked.
+	if not is_obj(node) or not node.has_meta("node_id"):
+		return null
+	var nid = str(node.get_meta("node_id"))
+	if not global.ModMapData.has(DATA_KEY) or not global.ModMapData[DATA_KEY].has(nid):
+		return null
+	var cfg = global.ModMapData[DATA_KEY][nid]
+	if not (cfg is Dictionary) or not cfg.get("enabled", false):
+		return null
+	return bool(cfg.get("link_sun", false))
+
+func set_link_from_soft(pressed: bool) -> void:
+	# The Link button beside the SOFT shadow dial was toggled: same as ours.
+	if ui.has("link_sun") and ui["link_sun"].pressed != pressed:
+		ui["link_sun"].pressed = pressed
+
+func _notify_soft_link_ui() -> void:
+	var soft = _soft_module()
+	if soft != null and soft.has_method("refresh_overlay_link_ui"):
+		soft.refresh_overlay_link_ui()
+
+# Breaks the link to the soft shadow's sun (hand edit with nothing to drive).
+func _unlink() -> void:
+	if ui.has("link_sun") and ui["link_sun"].pressed:
+		var prev = _syncing
+		_syncing = true
+		ui["link_sun"].pressed = false
+		_syncing = prev
+		_update_link_enabled(false)
+
+func _on_dial_input(event: InputEvent, dial: Control) -> void:
+	if event is InputEventMouseButton and event.button_index == BUTTON_LEFT:
+		dial.set_meta("dragging", event.pressed)
+		if event.pressed:
+			_update_dial_from_mouse(event.position, dial)
+	elif event is InputEventMouseMotion and dial.get_meta("dragging"):
+		_update_dial_from_mouse(event.position, dial)
+
+func _update_dial_from_mouse(pos: Vector2, dial: Control) -> void:
+	var radius = DIAL_SIZE / 2.0
+	var delta = pos - Vector2(radius, radius)
+	var dist = delta.length()
+	if dist > radius:
+		delta = delta.normalized() * radius
+		dist = radius
+	var frac = dist / radius
+	var angle = _world_from_spin(ui["angle_spin"].value)
+	if dist > 0.5:
+		angle = fposmod(rad2deg(atan2(delta.y, delta.x)), 360.0)
+	var snap_angle = dial.get_meta("snap_angle") as float
+	if snap_angle >= 0.0:
+		var sd = Vector2(cos(deg2rad(snap_angle)), sin(deg2rad(snap_angle)))
+		var proj = delta.dot(sd)
+		frac = 0.0 if proj <= 0.0 else min(proj, radius) / radius
+		angle = snap_angle
+	# Bevel: quadratic radius, like the soft shadow dial. Gradient: angle only,
+	# the stored Distance is left untouched.
+	var strength = frac * frac if _is_bevel_ui() else ui["strength_spin"].value / 100.0
+	_commit_sun(round(angle), strength)
+
+func _on_snap_toggled(pressed: bool, key: String, angle: float) -> void:
+	var dial = ui.get("dial")
+	if dial == null:
+		return
+	if pressed:
+		for k in SNAP_KEYS:
+			if k != key:
+				ui[k].pressed = false
+		dial.set_meta("snap_angle", angle)
+		var strength = ui["strength_spin"].value / 100.0
+		if strength <= 0.0 and _is_bevel_ui():
+			strength = 1.0
+		_commit_sun(angle, strength)
+	else:
+		dial.set_meta("snap_angle", -1.0)
+
+func _deactivate_snaps() -> void:
+	for k in SNAP_KEYS:
+		if ui.has(k):
+			ui[k].pressed = false
+	if ui.has("dial"):
+		ui["dial"].set_meta("snap_angle", -1.0)
+
+func _on_sun_spin_changed(_v) -> void:
+	if _syncing:
+		return
+	var angle = _world_from_spin(ui["angle_spin"].value)
+	var dial = ui.get("dial")
+	if dial != null and (dial.get_meta("snap_angle") as float) >= 0.0:
+		if abs(angle - (dial.get_meta("snap_angle") as float)) > 0.5:
+			_deactivate_snaps()
+	_commit_sun(angle, ui["strength_spin"].value / 100.0)
+
+# Sets spins + handle from (world sun angle deg, strength 0..1).
+func _set_dial(angle: float, strength: float) -> void:
+	if not ui.has("dial"):
+		return
+	var was = _syncing
+	_syncing = true
+	strength = clamp(strength, 0.0, 1.0)
+	ui["angle_spin"].value = round(_spin_from_world(angle))
+	ui["strength_spin"].value = round(strength * 100.0)
+	var radius = DIAL_SIZE / 2.0
+	var direction = Vector2(cos(deg2rad(angle)), sin(deg2rad(angle)))
+	# Handle position linear in the value (mouse -> value is quadratic): the
+	# handle slows down toward the center, like the other tools' dials.
+	# Gradient mode has no distance: the handle stays on the rim.
+	var shown = strength if _is_bevel_ui() else 1.0
+	var p = Vector2(radius, radius) + direction * shown * radius
+	ui["dial_dot"].rect_position = Vector2(p.x - 5, p.y - 5)
+	_syncing = was
+
+#########################################################################################################
 ## UI HELPERS
 #########################################################################################################
 
@@ -1073,17 +1539,26 @@ func _on_single_reset(key) -> void:
 	_syncing = true
 	if key == "shadow_color":
 		ui["color"].color = DEFAULTS["shadow_color"]
+	elif key == "sun":
+		_syncing = false
+		_deactivate_snaps()
+		_commit_sun(DEFAULTS["sun_angle"], DEFAULTS["sun_strength"])
+		return
 	elif ui.has(key + "_slider"):
-		ui[key + "_slider"].value = DEFAULTS[key]
-		ui[key + "_spin"].value = DEFAULTS[key]
+		ui[key + "_slider"].value = _default_for(key)
+		ui[key + "_spin"].value = _default_for(key)
 	_syncing = false
 	apply_to_selected(false, [key])
 
 func _on_reset() -> void:
 	_syncing = true
-	for key in ["sun_angle", "coverage", "diffusion", "curve", "opacity"]:
-		ui[key + "_slider"].value = DEFAULTS[key]
-		ui[key + "_spin"].value = DEFAULTS[key]
+	# The Style (Gradient / Bevel) is kept: Reset restores that style's defaults.
+	for key in SLIDER_KEYS:
+		ui[key + "_slider"].value = _default_for(key)
+		ui[key + "_spin"].value = _default_for(key)
+	_set_relief_buttons(RELIEFS.find(DEFAULTS["relief"]))
+	_deactivate_snaps()
+	_set_dial(DEFAULTS["sun_angle"], DEFAULTS["sun_strength"])
 	ui["color"].color = DEFAULTS["shadow_color"]
 	ui["link_sun"].pressed = DEFAULTS["link_sun"]
 	ui["lock_sun"].pressed = DEFAULTS["lock_sun"]
@@ -1099,10 +1574,13 @@ func _on_paste() -> void:
 	if _clipboard.empty():
 		return
 	_syncing = true
-	for key in ["sun_angle", "coverage", "diffusion", "curve", "opacity"]:
+	for key in SLIDER_KEYS:
 		if _clipboard.has(key):
 			ui[key + "_slider"].value = _clipboard[key]
 			ui[key + "_spin"].value = _clipboard[key]
+	_set_mode_ui(max(MODES.find(_clipboard.get("mode", LEGACY_MODE)), 0))
+	_set_relief_buttons(max(RELIEFS.find(_clipboard.get("relief", DEFAULTS["relief"])), 0))
+	_set_dial(float(_clipboard.get("sun_angle", DEFAULTS["sun_angle"])), float(_clipboard.get("sun_strength", DEFAULTS["sun_strength"])))
 	if _clipboard.has("shadow_color"):
 		var sc = _clipboard["shadow_color"]
 		if sc is String:
@@ -1155,6 +1633,11 @@ func _on_link_toggled(pressed) -> void:
 		_syncing = true
 		ui["lock_sun"].pressed = false
 		_syncing = false
+	# Linking: show the soft shadow's sun on the dial right away.
+	if pressed and not _syncing and _monitored != null and is_instance_valid(_monitored) and _monitored.has_meta("node_id"):
+		var ls = _linked_sun(str(_monitored.get_meta("node_id")))
+		if ls != null:
+			_set_dial(ls[0] if ls[0] != null else _world_from_spin(ui["angle_spin"].value), ls[1])
 	_update_link_enabled(pressed)
 	if not _syncing:
 		apply_to_selected(false, ["link_sun", "lock_sun"])
@@ -1172,26 +1655,26 @@ func _on_lock_toggled(pressed) -> void:
 	# unlock -> local angle becomes the equivalent WORLD angle
 	var xf = _monitored_sun_xform()
 	if xf != null:
-		var deg = ui["sun_angle_spin"].value
+		var deg = _world_from_spin(ui["angle_spin"].value)
 		var v = Vector2(cos(deg2rad(deg)), sin(deg2rad(deg)))
 		if pressed:
 			# If we were linked, start from the live linked world angle.
 			if _monitored != null and is_instance_valid(_monitored) and _monitored.has_meta("_overlay_config"):
 				var ocfg = _monitored.get_meta("_overlay_config")
 				if ocfg is Dictionary and ocfg.get("link_sun", false):
-					var lsun = _linked_sun_angle(str(_monitored.get_meta("node_id")))
-					if lsun != null:
-						v = Vector2(cos(deg2rad(lsun)), sin(deg2rad(lsun)))
+					var ls = _linked_sun(str(_monitored.get_meta("node_id")))
+					if ls != null and ls[0] != null:
+						v = Vector2(cos(deg2rad(ls[0])), sin(deg2rad(ls[0])))
 			v = xf.affine_inverse().basis_xform(v)
 		else:
 			v = xf.basis_xform(v)
 		if v.length_squared() > 0.0:
 			var nd = fmod(rad2deg(atan2(v.y, v.x)) + 360.0, 360.0)
-			ui["sun_angle_slider"].value = round(nd)
-			ui["sun_angle_spin"].value = round(nd)
+			_deactivate_snaps()
+			_set_dial(round(nd), ui["strength_spin"].value / 100.0)
 	_syncing = false
 	_update_link_enabled(ui["link_sun"].pressed)
-	apply_to_selected(false, ["lock_sun", "link_sun", "sun_angle"])
+	apply_to_selected(false, ["lock_sun", "link_sun", "sun_angle", "sun_strength"])
 
 func _monitored_sun_xform():
 	# Global transform of the monitored object's sprite (same space as its
@@ -1204,24 +1687,28 @@ func _monitored_sun_xform():
 	return sprite.global_transform
 
 func _update_link_enabled(linked) -> void:
-	# When linked, the Sun ° controls are driven by the soft shadow -> grey + lock.
-	# The Link button itself is greyed out while the sun is locked to the texture.
-	# While Global Illumination drives the overlays, the whole Sun row is greyed.
+	# The Link button is greyed out while the sun is locked to the texture.
+	# While Global Illumination drives the overlays, the whole sun row is greyed.
 	var gi = _global_sun != null
 	if ui.has("link_sun") and ui.has("lock_sun"):
 		ui["link_sun"].disabled = ui["lock_sun"].pressed or gi
 		ui["lock_sun"].disabled = gi
-	var en = not linked and not gi
-	var tint = Color(1, 1, 1, 1.0) if en else Color(1, 1, 1, 0.4)
+	# Linked: the dial and spins stay live — editing them drives the soft
+	# shadow's dial too (see _commit_sun). Global Illumination only drives the
+	# angle: Distance stays the overlay's own (spin).
 	var tip = "Driven by Global Illumination" if gi else ""
-	if ui.has("sun_angle_slider"):
-		ui["sun_angle_slider"].editable = en
-		ui["sun_angle_slider"].modulate = tint
-		ui["sun_angle_slider"].hint_tooltip = tip
-	if ui.has("sun_angle_spin"):
-		ui["sun_angle_spin"].editable = en
-		ui["sun_angle_spin"].modulate = tint
-		ui["sun_angle_spin"].hint_tooltip = tip
+	if ui.has("angle_spin"):
+		ui["angle_spin"].editable = not gi
+		ui["angle_spin"].modulate = Color(1, 1, 1, 0.4) if gi else Color(1, 1, 1, 1.0)
+		ui["angle_spin"].hint_tooltip = tip
+	if ui.has("dial"):
+		var dial_off = gi
+		ui["dial"].mouse_filter = Control.MOUSE_FILTER_IGNORE if dial_off else Control.MOUSE_FILTER_STOP
+		ui["dial"].modulate = Color(1, 1, 1, 0.4) if dial_off else Color(1, 1, 1, 1.0)
+		ui["dial"].hint_tooltip = tip
+	for k in SNAP_KEYS:
+		if ui.has(k):
+			ui[k].disabled = gi
 
 # Global Illumination: impose `deg` (world sun angle) on every overlay, or
 # null to give them back their own sun. The per-frame sync picks it up; the
@@ -1237,11 +1724,31 @@ func set_global_sun(deg) -> void:
 	# restore the selected object's own angle in the UI when it comes back.
 	if v == null and _monitored != null and is_instance_valid(_monitored) and _monitored.has_meta("_overlay_config"):
 		var ocfg = _monitored.get_meta("_overlay_config")
-		if ocfg is Dictionary and ui.has("sun_angle_slider"):
-			_syncing = true
-			ui["sun_angle_slider"].value = round(float(ocfg.get("sun_angle", DEFAULTS["sun_angle"])))
-			ui["sun_angle_spin"].value = round(float(ocfg.get("sun_angle", DEFAULTS["sun_angle"])))
-			_syncing = false
+		if ocfg is Dictionary and ui.has("dial"):
+			_set_dial(round(float(ocfg.get("sun_angle", DEFAULTS["sun_angle"]))), float(ocfg.get("sun_strength", DEFAULTS["sun_strength"])))
+
+func _linked_sun(node_id):
+	# [world sun angle (deg) or null, strength 0..1] of the object's soft (drop)
+	# shadow, or null if it has none. Angle is null when the shadow has no
+	# direction (zero offset). Strength = dial distance (offset length over the
+	# dial radius; projected shadows are fully directional).
+	# Preferred: the soft shadow module's own answer — strength = its dial's
+	# HANDLE POSITION, whatever the style (Offset / Projected) and Max Distance.
+	var soft = _soft_module()
+	if soft != null and soft.has_method("overlay_link_sun"):
+		return soft.overlay_link_sun(node_id)
+	if not global.ModMapData.has("DropShadow"):
+		return null
+	var dd = global.ModMapData["DropShadow"]
+	if not dd.has(node_id) or not (dd[node_id] is Dictionary):
+		return null
+	var dsc = dd[node_id]
+	var strength = 1.0
+	if dsc.get("shadow_mode", "offset") != "projected":
+		var lox = float(dsc.get("offset_x", 0.0))
+		var loy = float(dsc.get("offset_y", 0.0))
+		strength = clamp(sqrt(lox * lox + loy * loy) / SOFT_OFFSET_MAX, 0.0, 1.0)
+	return [_linked_sun_angle(node_id), strength]
 
 func _linked_sun_angle(node_id):
 	# World sun angle (deg) of the object's soft (drop) shadow, or null if none.
@@ -1275,7 +1782,10 @@ func _linked_sun_angle(node_id):
 func get_config_from_ui() -> Dictionary:
 	return {
 		"enabled": ui["enable"].pressed,
-		"sun_angle": ui["sun_angle_spin"].value,
+		"sun_angle": _world_from_spin(ui["angle_spin"].value),
+		"sun_strength": ui["strength_spin"].value / 100.0,
+		"mode": MODES[1 if _is_bevel_ui() else 0],
+		"relief": RELIEFS[1 if ui["relief_btn_1"].pressed else 0],
 		"coverage": ui["coverage_spin"].value,
 		"diffusion": ui["diffusion_spin"].value,
 		"curve": ui["curve_spin"].value,
@@ -1294,9 +1804,14 @@ func load_ui_from_object(obj) -> void:
 	if global.ModMapData.has(DATA_KEY) and global.ModMapData[DATA_KEY].has(nid):
 		for k in global.ModMapData[DATA_KEY][nid].keys():
 			cfg[k] = global.ModMapData[DATA_KEY][nid][k]
+		if not global.ModMapData[DATA_KEY][nid].has("mode"):
+			cfg["mode"] = LEGACY_MODE
+	else:
+		# Never had an overlay: brand new one -> bevel defaults.
+		cfg["mode"] = DEFAULTS["mode"]
 	_syncing = true
 	ui["enable"].pressed = cfg.get("enabled", false)
-	for key in ["sun_angle", "coverage", "diffusion", "curve", "opacity"]:
+	for key in SLIDER_KEYS:
 		ui[key + "_slider"].value = cfg[key]
 		ui[key + "_spin"].value = cfg[key]
 	var sc = cfg.get("shadow_color", Color(0, 0, 0, 1))
@@ -1305,6 +1820,18 @@ func load_ui_from_object(obj) -> void:
 	ui["color"].color = sc
 	ui["link_sun"].pressed = cfg.get("link_sun", false)
 	ui["lock_sun"].pressed = cfg.get("lock_sun", false)
+	_set_mode_ui(max(MODES.find(cfg.get("mode", LEGACY_MODE)), 0))
+	_set_relief_buttons(max(RELIEFS.find(cfg.get("relief", DEFAULTS["relief"])), 0))
+	_deactivate_snaps()
+	var dial_angle = float(cfg.get("sun_angle", DEFAULTS["sun_angle"]))
+	var dial_strength = float(cfg.get("sun_strength", DEFAULTS["sun_strength"]))
+	if cfg.get("link_sun", false):
+		var ls = _linked_sun(nid)
+		if ls != null:
+			if ls[0] != null:
+				dial_angle = ls[0]
+			dial_strength = ls[1]
+	_set_dial(dial_angle, dial_strength)
 	_update_link_enabled(ui["link_sun"].pressed)
 	ui["ignore_transparency"].pressed = cfg.get("ignore_transparency", false)
 	_syncing = false
@@ -1404,6 +1931,7 @@ func history_apply(payload) -> void:
 	if refresh and _monitored != null and is_instance_valid(_monitored):
 		load_ui_from_object(_monitored)
 	_history_suspend = false
+	_notify_soft_link_ui()
 
 
 func apply_to_selected(force_all: bool = false, changed_keys: Array = []) -> void:
@@ -1438,11 +1966,14 @@ func apply_to_selected(force_all: bool = false, changed_keys: Array = []) -> voi
 		else:
 			remove_shadow(node)
 		save_data(node, cfg)
+	_notify_soft_link_ui()
 
 func _saved_or_default_cfg(nid: String) -> Dictionary:
 	var cfg: Dictionary
 	if global.ModMapData.has(DATA_KEY) and global.ModMapData[DATA_KEY].has(nid):
 		cfg = global.ModMapData[DATA_KEY][nid].duplicate(true)
+		if not cfg.has("mode"):
+			cfg["mode"] = LEGACY_MODE
 	else:
 		cfg = DEFAULTS.duplicate(true)
 	if cfg.has("shadow_color") and cfg["shadow_color"] is String:
@@ -1467,6 +1998,7 @@ func on_selection_changed() -> void:
 		_reparent_ui_to_node(sel[0])
 		_monitored = sel[0]
 		load_ui_from_object(sel[0])
+		_notify_soft_link_ui()
 		return
 	var c = ui.get("container")
 	if c != null and c.get_parent() != null:

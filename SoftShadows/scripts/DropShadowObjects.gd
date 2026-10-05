@@ -3083,7 +3083,13 @@ func build_select_tool_ui():
 	dial_margin.add_constant_override("margin_bottom", 8)
 	var dial = _create_dial(90, OFFSET_MAX)
 	dial_margin.add_child(dial)
-	dial_container.add_child(dial_margin)
+	# Link button beside the dial (shown only when the asset has an overlay
+	# shadow): same state as the overlay section's own Link button.
+	var dial_row = HBoxContainer.new()
+	dial_row.add_constant_override("separation", 12)
+	dial_row.add_child(dial_margin)
+	dial_row.add_child(_make_overlay_link_button("overlay_link_btn"))
+	dial_container.add_child(dial_row)
 	offset_vbox.add_child(dial_container)
 
 	settings_panel.add_child(offset_vbox)
@@ -3173,7 +3179,11 @@ func build_select_tool_ui():
 	pdial_margin.add_constant_override("margin_bottom", 8)
 	var pdial = _create_proj_dirlen_dial(90)
 	pdial_margin.add_child(pdial)
-	pdial_container.add_child(pdial_margin)
+	var pdial_row = HBoxContainer.new()
+	pdial_row.add_constant_override("separation", 12)
+	pdial_row.add_child(pdial_margin)
+	pdial_row.add_child(_make_overlay_link_button("overlay_link_btn_proj"))
+	pdial_container.add_child(pdial_row)
 	proj_vbox.add_child(pdial_container)
 
 	# Fade slider (estompe vers la pointe)
@@ -6204,6 +6214,118 @@ func load_shadow_ui_from_object(obj):
 		ui_config["settings_panel"].visible = true
 	else:
 		ui_config["settings_panel"].visible = false
+	refresh_overlay_link_ui()
+
+#########################################################################################################
+##
+## OVERLAY LINK (OverlayShadowObjects) — shared Link button + two-way sun
+##
+#########################################################################################################
+# When an overlay shadow is linked, both dials show ONE sun: moving the soft
+# shadow dial moves the overlay (it polls overlay_link_sun), and moving the
+# overlay dial moves the soft shadow (overlay_drive_sun). The link flag itself
+# lives in the overlay's config; the buttons beside our dials only mirror it.
+# The shared "distance" is the HANDLE POSITION on the dial (0 = center, 1 =
+# rim), whatever the style (Offset / Projected) and the Max Distance.
+
+var _overlay_link_syncing = false
+var _overlay_drive_len = 0.0   # offset length kept while the overlay drives the angle only
+
+func _overlay_module():
+	return core.get("overlay_shadow_objects") if core != null else null
+
+func _make_overlay_link_button(key: String) -> Button:
+	var btn = _make_icon_button("icons/link.png", "Link the overlay shadow's sun to this dial (moving either dial moves both)", 0.5)
+	btn.toggle_mode = true
+	btn.visible = false
+	btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	btn.connect("toggled", self, "_on_overlay_link_toggled")
+	ui_config[key] = btn
+	return btn
+
+# Shows the Link buttons only when the shown object has an overlay shadow, and
+# mirrors its link state. Called on UI load and by the overlay module.
+func refresh_overlay_link_ui() -> void:
+	var state = null
+	var ov = _overlay_module()
+	if ov != null and ov.has_method("get_link_state") and _monitored_object != null and is_instance_valid(_monitored_object):
+		state = ov.get_link_state(_monitored_object)
+	_overlay_link_syncing = true
+	for key in ["overlay_link_btn", "overlay_link_btn_proj"]:
+		if ui_config.has(key):
+			ui_config[key].visible = state != null
+			ui_config[key].pressed = (state == true)
+	_overlay_link_syncing = false
+
+func _on_overlay_link_toggled(pressed) -> void:
+	if _overlay_link_syncing:
+		return
+	var ov = _overlay_module()
+	if ov != null and ov.has_method("set_link_from_soft"):
+		ov.set_link_from_soft(pressed)
+	refresh_overlay_link_ui()
+
+# [world sun angle (deg) or null, handle position 0..1] of this object's soft
+# shadow, or null when it has none. Angle is null when an Offset shadow has no
+# direction (zero offset).
+func overlay_link_sun(node_id):
+	if not global.ModMapData.has(SHADOW_DATA_KEY):
+		return null
+	var d = global.ModMapData[SHADOW_DATA_KEY]
+	if not d.has(node_id) or not (d[node_id] is Dictionary):
+		return null
+	var sc = d[node_id]
+	if not sc.get("enabled", false):
+		return null
+	if sc.get("shadow_mode", "offset") == "projected":
+		var sun = fposmod(rad2deg(float(sc.get("proj_angle", 0.0))) + 180.0, 360.0)
+		return [sun, _proj_frac_from_len(float(sc.get("proj_length", 0.0)))]
+	var ox = float(sc.get("offset_x", 0.0))
+	var oy = float(sc.get("offset_y", 0.0))
+	var dist = sqrt(ox * ox + oy * oy)
+	var max_offset = max(float(sc.get("range", 1.0)), 1.0) * OFFSET_MAX
+	var ang = null
+	if dist >= 0.5:
+		ang = fposmod(rad2deg(atan2(-oy, -ox)), 360.0)
+	# Same quadratic radius as the dial (see _update_dial_dot_position).
+	return [ang, sqrt(clamp(dist / max_offset, 0.0, 1.0))]
+
+# The linked overlay dial moved: put our dial's handle at (sun_deg, frac) and
+# apply, exactly as if the user had dragged it (history, multi-selection).
+# angle_only: the overlay has no distance (Gradient mode) -> keep ours.
+# Returns false when there is nothing to drive (no shadow on the shown object).
+func overlay_drive_sun(node, sun_deg: float, frac: float, angle_only: bool) -> bool:
+	if node == null or node != _monitored_object or _loading_ui:
+		return false
+	if not has_shadow_enabled(node) or not ui_config.has("mode_opt") or not ui_config.has("dial"):
+		return false
+	frac = clamp(frac, 0.0, 1.0)
+	var r = deg2rad(sun_deg)
+	if ui_config["mode_opt"].selected == 0:
+		var max_offset = ui_config["dial"].get_meta("max_offset") as float
+		var length = frac * frac * max_offset
+		if angle_only:
+			# Offsets are rounded to whole px: reuse the remembered length so
+			# the distance doesn't drift while the angle is dragged around.
+			var cx = ui_config["offset_x_spin"].value
+			var cy = ui_config["offset_y_spin"].value
+			var cur = sqrt(cx * cx + cy * cy)
+			if abs(cur - _overlay_drive_len) > 1.0:
+				_overlay_drive_len = cur
+			length = _overlay_drive_len
+		_deactivate_all_snaps()
+		_set_dial_values(round(-cos(r) * length), round(-sin(r) * length))
+		apply_shadow_to_selected(false, ["offset_x", "offset_y"])
+	else:
+		_deactivate_all_proj_snaps()
+		_syncing_ui = true
+		if not angle_only:
+			ui_config["proj_dist_spin"].value = _proj_len_from_frac(frac)
+			_proj_dist_prev = ui_config["proj_dist_spin"].value
+		ui_config["proj_sun_angle_spin"].value = round(fposmod(sun_deg, 360.0))
+		_syncing_ui = false
+		_apply_proj_from_spins()
+	return true
 
 #########################################################################################################
 ##

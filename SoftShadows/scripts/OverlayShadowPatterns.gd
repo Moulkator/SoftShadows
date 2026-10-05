@@ -586,7 +586,7 @@ func _build_settings(parent, store: Dictionary, prefix: String) -> void:
 		rbtn.hint_tooltip = relief_tips[i]
 		rbtn.toggle_mode = true
 		rbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		rbtn.align = Button.ALIGN_LEFT
+		rbtn.align = Button.ALIGN_CENTER
 		rbtn.focus_mode = Control.FOCUS_NONE
 		rbtn.connect("pressed", self, "_on_relief_pressed", [i, prefix])
 		rrow.add_child(rbtn)
@@ -752,13 +752,13 @@ func _update_link_enabled(store: Dictionary) -> void:
 	var gi = _global_sun != null
 	store["link_sun"].disabled = store["lock_sun"].pressed or gi
 	store["lock_sun"].disabled = gi
-	var en = not store["link_sun"].pressed
-	var tint = Color(1, 1, 1, 1.0) if en else Color(1, 1, 1, 0.4)
-	store["angle_spin"].editable = en and not gi
-	store["angle_spin"].modulate = tint if not gi else Color(1, 1, 1, 0.4)
+	# Linked: the dial and spins stay live — editing them drives the soft
+	# shadow's dial too (see _commit_sun).
+	store["angle_spin"].editable = not gi
+	store["angle_spin"].modulate = Color(1, 1, 1, 0.4) if gi else Color(1, 1, 1, 1.0)
 	store["angle_spin"].hint_tooltip = "Driven by Global Illumination" if gi else ""
-	store["strength_spin"].editable = en
-	store["strength_spin"].modulate = tint
+	store["strength_spin"].editable = true
+	store["strength_spin"].modulate = Color(1, 1, 1, 1.0)
 	if store.has("dial"):
 		store["dial"].mouse_filter = Control.MOUSE_FILTER_IGNORE if gi else Control.MOUSE_FILTER_STOP
 		store["dial"].modulate = Color(1, 1, 1, 0.4) if gi else Color(1, 1, 1, 1.0)
@@ -939,7 +939,45 @@ func _create_dial(store: Dictionary, prefix: String) -> Control:
 	store["dial_dot"] = handle
 	return dial
 
-# Editing the sun by hand breaks the link to the soft shadow's sun.
+# A sun edit made on the overlay's dial / spins. Linked (Select Tool) and the
+# pattern has a soft shadow: the link is two-way, so the soft shadow's dial is
+# driven and the overlay follows it. Otherwise (no soft shadow to drive) a hand
+# edit breaks the link, as before.
+func _commit_sun(store: Dictionary, prefix: String, angle: float, strength: float) -> void:
+	var driven = false
+	if prefix == "sel" and store["link_sun"].pressed and _monitored != null and is_instance_valid(_monitored):
+		if dropshadow_patterns != null and dropshadow_patterns.has_method("overlay_drive_sun"):
+			driven = dropshadow_patterns.overlay_drive_sun(_monitored, angle, strength)
+	if not driven:
+		_unlink(store)
+	_set_dial(store, angle, strength)
+	# Driven: the soft shadow module records the undo step; our own copy of
+	# the sun is saved silently (it only matters once unlinked).
+	var was = _history_suspend
+	if driven:
+		_history_suspend = true
+	_after_change(prefix, false, ["sun_angle", "sun_strength", "link_sun"])
+	_history_suspend = was
+
+func get_link_state(node):
+	# null = no overlay shadow on this pattern; else whether its sun is linked.
+	if not is_pattern(node):
+		return null
+	var cfg = _saved_cfg(_node_id(node))
+	if cfg == null or not cfg.get("enabled", false):
+		return null
+	return bool(cfg.get("link_sun", false))
+
+func set_link_from_soft(pressed: bool) -> void:
+	# The Link button beside the SOFT shadow dial was toggled: same as ours.
+	if ui.has("link_sun") and ui["link_sun"].pressed != pressed:
+		ui["link_sun"].pressed = pressed
+
+func _notify_soft_link_ui() -> void:
+	if dropshadow_patterns != null and dropshadow_patterns.has_method("refresh_overlay_link_ui"):
+		dropshadow_patterns.refresh_overlay_link_ui()
+
+# Breaks the link to the soft shadow's sun (hand edit with nothing to drive).
 func _unlink(store: Dictionary) -> void:
 	if store.has("link_sun") and store["link_sun"].pressed:
 		var prev = _syncing
@@ -974,10 +1012,8 @@ func _update_dial_from_mouse(pos: Vector2, dial: Control, prefix: String) -> voi
 		var proj = delta.dot(sd)
 		frac = 0.0 if proj <= 0.0 else min(proj, radius) / radius
 		angle = snap_angle
-	_unlink(store)
 	# Quadratic radius, like the soft shadow dial.
-	_set_dial(store, round(angle), frac * frac)
-	_after_change(prefix, false, ["sun_angle", "sun_strength", "link_sun"])
+	_commit_sun(store, prefix, round(angle), frac * frac)
 
 func _on_snap_toggled(pressed: bool, key: String, angle: float, prefix: String) -> void:
 	var store = _store(prefix)
@@ -989,12 +1025,10 @@ func _on_snap_toggled(pressed: bool, key: String, angle: float, prefix: String) 
 			if k != key:
 				store[k].pressed = false
 		dial.set_meta("snap_angle", angle)
-		_unlink(store)
 		var strength = store["strength_spin"].value / 100.0
 		if strength <= 0.0:
 			strength = 1.0
-		_set_dial(store, angle, strength)
-		_after_change(prefix, false, ["sun_angle", "sun_strength", "link_sun"])
+		_commit_sun(store, prefix, angle, strength)
 	else:
 		dial.set_meta("snap_angle", -1.0)
 
@@ -1014,8 +1048,7 @@ func _on_sun_spin_changed(_v, prefix: String) -> void:
 	if dial != null and (dial.get_meta("snap_angle") as float) >= 0.0:
 		if abs(angle - (dial.get_meta("snap_angle") as float)) > 0.5:
 			_deactivate_snaps(store)
-	_set_dial(store, angle, store["strength_spin"].value / 100.0)
-	_after_change(prefix, false, ["sun_angle", "sun_strength"])
+	_commit_sun(store, prefix, angle, store["strength_spin"].value / 100.0)
 
 # Sets spins + handle from (sun angle deg, strength 0..1).
 func _set_dial(store: Dictionary, angle: float, strength: float) -> void:
@@ -1080,6 +1113,7 @@ func on_selection_changed() -> void:
 				mcfg["sun_angle"] = ls[0]
 				mcfg["sun_strength"] = ls[1]
 		_store_from_cfg(ui, mcfg)
+		_notify_soft_link_ui()
 		return
 	if c.get_parent() != null:
 		c.get_parent().remove_child(c)
@@ -1218,9 +1252,9 @@ func _on_single_reset(key, prefix: String) -> void:
 	if key == "shadow_color":
 		store["color"].color = DEFAULTS["shadow_color"]
 	elif key == "sun":
-		_set_dial(store, DEFAULTS["sun_angle"], DEFAULTS["sun_strength"])
 		_syncing = false
-		_after_change(prefix, false, ["sun_angle", "sun_strength"])
+		_deactivate_snaps(store)
+		_commit_sun(store, prefix, DEFAULTS["sun_angle"], DEFAULTS["sun_strength"])
 		return
 	elif store.has(key + "_slider"):
 		store[key + "_slider"].value = DEFAULTS[key]
@@ -1278,6 +1312,7 @@ func apply_to_selected(force_all: bool = false, changed_keys: Array = []) -> voi
 		else:
 			remove_shadow(node)
 		save_data(node, cfg)
+	_notify_soft_link_ui()
 
 #########################################################################################################
 ## UNDO/REDO — SETTINGS TRANSACTIONS
@@ -1360,3 +1395,4 @@ func history_apply(payload) -> void:
 	if refresh and _monitored != null and is_instance_valid(_monitored):
 		_store_from_cfg(ui, _saved_or_default_cfg(_node_id(_monitored)))
 	_history_suspend = false
+	_notify_soft_link_ui()

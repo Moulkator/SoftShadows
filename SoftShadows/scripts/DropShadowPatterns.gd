@@ -965,7 +965,22 @@ func _build_offset_dial(parent, store: Dictionary, prefix: String) -> void:
 	for m in ["margin_left", "margin_right", "margin_top", "margin_bottom"]:
 		mc.add_constant_override(m, 8)
 	mc.add_child(_create_dial(store, prefix))
-	cc.add_child(mc)
+	if prefix == "sel":
+		# Link button beside the dial (shown only when the pattern has an
+		# overlay shadow): same state as the overlay section's Link button.
+		var dial_row = HBoxContainer.new()
+		dial_row.add_constant_override("separation", 12)
+		dial_row.add_child(mc)
+		var link_btn = _make_icon_button("icons/link.png", "Link the overlay shadow's sun to this dial (moving either dial moves both)", 0.5)
+		link_btn.toggle_mode = true
+		link_btn.visible = false
+		link_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		link_btn.connect("toggled", self, "_on_overlay_link_toggled")
+		dial_row.add_child(link_btn)
+		store["overlay_link_btn"] = link_btn
+		cc.add_child(dial_row)
+	else:
+		cc.add_child(mc)
 	cc.visible = (prefix != "pt")
 	parent.add_child(cc)
 
@@ -1204,6 +1219,7 @@ func on_selection_changed() -> void:
 		_monitored = sel[0]
 		_update_shadow_layer_ui_max()
 		_store_from_cfg(ui, _saved_or_default_cfg(_node_id(sel[0])))
+		refresh_overlay_link_ui()
 		return
 	var c = ui["container"]
 	if c.get_parent() != null:
@@ -1567,6 +1583,53 @@ func set_shadow_offset(node, ox: float, oy: float) -> void:
 		var ov = core.get("overlay_shadow_patterns")
 		if ov != null and ov.has_method("on_soft_shadow_changed"):
 			ov.on_soft_shadow_changed([node])
+
+#########################################################################################################
+## OVERLAY LINK (OverlayShadowPatterns) — shared Link button + two-way sun
+#########################################################################################################
+# When the overlay shadow is linked, both dials show ONE sun: moving this dial
+# moves the overlay (on_soft_shadow_changed), and moving the overlay dial moves
+# this one (overlay_drive_sun). The link flag lives in the overlay's config;
+# the button beside our dial only mirrors it.
+
+var _overlay_link_syncing = false
+
+func _overlay_module():
+	return core.get("overlay_shadow_patterns") if core != null else null
+
+# Shows the Link button only when the shown pattern has an overlay shadow, and
+# mirrors its link state. Called on selection and by the overlay module.
+func refresh_overlay_link_ui() -> void:
+	if not ui.has("overlay_link_btn"):
+		return
+	var state = null
+	var ov = _overlay_module()
+	if ov != null and ov.has_method("get_link_state") and _monitored != null and is_instance_valid(_monitored):
+		state = ov.get_link_state(_monitored)
+	_overlay_link_syncing = true
+	ui["overlay_link_btn"].visible = state != null
+	ui["overlay_link_btn"].pressed = (state == true)
+	_overlay_link_syncing = false
+
+func _on_overlay_link_toggled(pressed) -> void:
+	if _overlay_link_syncing:
+		return
+	var ov = _overlay_module()
+	if ov != null and ov.has_method("set_link_from_soft"):
+		ov.set_link_from_soft(pressed)
+	refresh_overlay_link_ui()
+
+# The linked overlay dial moved: set our dial to (world sun angle, strength
+# 0..1 = distance / OFFSET_MAX) and apply, exactly as if the user had dragged
+# it (history, multi-selection). Returns false when there is nothing to drive.
+func overlay_drive_sun(node, sun_world_deg: float, strength: float) -> bool:
+	if node == null or node != _monitored or not has_shadow_enabled(node) or not ui.has("dial"):
+		return false
+	_deactivate_snaps(ui)
+	# Dial convention: offset = (-sin a, cos a), sun = -offset -> a = world + 90.
+	_set_dial(ui, round(fposmod(sun_world_deg + 90.0, 360.0)), round(clamp(strength, 0.0, 1.0) * OFFSET_MAX))
+	_after_change("sel", false, ["sun_angle", "offset_dist"])
+	return true
 
 #########################################################################################################
 ## PRESETS (lib/ShadowPresets.gd) — adapter
