@@ -1,5 +1,12 @@
 SOFT SHADOWS
 
+v1.7.4
+- Added a new "Bevel" style for Overlay Shadows on objects. The previous overlay is now the "Gradient" style.
+- New objects overlays use the Bevel style by default (existing overlays stay in Gradient)
+- Replaced the Sun° slider of objects overlays with a sun dial (same as patterns)
+- Added a Link button next to the Soft Shadow dial when the asset has an overlay (moving either dial moves the other)
+- Centered the Raised / Lowered buttons for patterns overlays (and for the new buttons for objects)
+
 v1.7.3
 - Fixed a bug when you selected twice the same shadow mode for walls or paths (Simple or Realistic) causing the shadow to become darker or lighter
 
