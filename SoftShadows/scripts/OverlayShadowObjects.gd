@@ -1094,7 +1094,7 @@ func build_ui() -> void:
 	_update_link_enabled(DEFAULTS["link_sun"])
 
 	_add_slider(sp, "Coverage", "coverage", 0.0, 1.0, 0.01)
-	_add_slider(sp, "Diffusion", "diffusion", 0.0, 1.0, 0.01)
+	_add_slider(sp, "Blur", "diffusion", 0.0, 1.0, 0.01)
 	_add_slider(sp, "Curve", "curve", -2.0, 2.0, 0.01)
 	_add_slider(sp, "Opacity", "opacity", 0.05, 1.0, 0.01)
 

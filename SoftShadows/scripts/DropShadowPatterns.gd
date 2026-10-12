@@ -1551,6 +1551,56 @@ func set_shadow_enabled(nodes, enabled: bool) -> void:
 		save_data(node, cfg)
 
 #########################################################################################################
+## SHARED SETTINGS API (SelectionShadowToggle — mixed-selection panel)
+#########################################################################################################
+# The mixed-selection panel edits the settings every selected asset type has
+# in common. It reads each node's saved config and hands back, per node, only
+# the keys that changed (already converted to this module's own ranges).
+
+func shared_type() -> String:
+	return "patterns"
+
+# Saved config of a node whose shadow is ON (colors as Color), else null.
+func shared_saved_config(node):
+	if not has_shadow_enabled(node):
+		return null
+	return _saved_cfg(_node_id(node))
+
+# entries = [[node, {key: value}], ...]. The special key "__offset" = [ox, oy]
+# (world px) goes through set_shadow_offset. Nodes without an enabled shadow
+# are skipped. One history transaction.
+func shared_apply(entries: Array) -> void:
+	var targets = []
+	for e in entries:
+		if has_shadow_enabled(e[0]):
+			targets.append(e)
+	if targets.empty():
+		return
+	_history_touch("shared")
+	var changed_nodes = []
+	for e in targets:
+		var node = e[0]
+		var changes = e[1].duplicate()
+		var offset = changes.get("__offset", null)
+		changes.erase("__offset")
+		if not changes.empty():
+			var cfg = shared_saved_config(node)
+			for k in changes.keys():
+				cfg[k] = changes[k]
+			if cfg.get("custom_layer", false):
+				cfg["shadow_layer"] = effective_shadow_layer(node, cfg)
+			create_shadow(node, cfg)
+			save_data(node, cfg)
+			changed_nodes.append(node)
+		if offset != null:
+			set_shadow_offset(node, float(offset[0]), float(offset[1]))
+	# Linked overlays follow the soft shadow (set_shadow_offset already notifies).
+	if not changed_nodes.empty() and core != null:
+		var ov = core.get("overlay_shadow_patterns")
+		if ov != null and ov.has_method("on_soft_shadow_changed"):
+			ov.on_soft_shadow_changed(changed_nodes)
+
+#########################################################################################################
 ## OFFSET API (GlobalIllumination) — patterns store sun_angle + offset_dist
 #########################################################################################################
 

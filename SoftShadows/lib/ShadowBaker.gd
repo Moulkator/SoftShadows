@@ -28,7 +28,7 @@ extends Reference
 
 
 
-const BUILD := "BAKER-WAVE-1"
+const BUILD := "BAKER-WAVE-2"
 
 const DEBOUNCE_MS := 1500
 # Verbose bake logging. false = silent (default). Flip to true to trace the bake
@@ -80,6 +80,31 @@ const SHADER_PARAMS = [
 	"ft_corner_bl",
 	"ft_tex_size",
 	"ft_center_px",
+]
+
+# Wall/path clip params ("Stopped by walls/paths"). Copied only when the live
+# shadow is actually clipped (poly_count > 0), so the clip is burned into the
+# baked image. They are all WORLD-space values fed through uniforms (the shader
+# never reads the node's real transform), so they stay valid inside the bake
+# viewport. DropShadowObjects re-bakes when the clip changes (wall/path edited,
+# object moved) — see _clip_tick there.
+const CLIP_PARAMS = [
+	"sprite_world_pos",
+	"sprite_world_rot",
+	"sprite_world_scale",
+	"obj_world_pos",
+	"shadow_clip_radius",
+	"poly_data_tex",
+	"poly_data_size",
+	"poly_count",
+	"poly_def0",
+	"poly_def1",
+	"poly_def2",
+	"poly_def3",
+	"poly_def4",
+	"poly_def5",
+	"poly_def6",
+	"poly_def7",
 ]
 
 # Meta key set on a shadow Sprite after it's been baked. Used so _fast_update_shadow
@@ -424,9 +449,34 @@ static func _build_render_sprite(source_sprite: Sprite, viewport_size: Vector2,
 		var v = source_mat.get_shader_param(p)
 		if v != null:
 			mat.set_shader_param(p, v)
-	# Zero clip params — the baked image is the unclipped shadow. Clipped props
-	# rebake on position change via the debounce manager.
-	mat.set_shader_param("poly_count", 0)
+	# Wall/path clip: burn it into the bake when the live shadow is clipped.
+	var poly_count = source_mat.get_shader_param("poly_count")
+	if poly_count != null and int(poly_count) > 0:
+		for p in CLIP_PARAMS:
+			var cv = source_mat.get_shader_param(p)
+			if cv != null:
+				mat.set_shader_param(p, cv)
+		# The shader maps the expanded local vertex to world space. The live
+		# sprite expands its quad around quad_center_px; this render sprite
+		# expands around 0 (quad_center_px is not copied). Shift the world
+		# origin by the difference so every baked pixel resolves to the same
+		# world position as in the live shadow.
+		var vsxy = source_mat.get_shader_param("vertex_scale_xy")
+		if not (vsxy is Vector2):
+			vsxy = Vector2.ONE
+		var live_qc = source_mat.get_shader_param("quad_center_px")
+		if not (live_qc is Vector2):
+			live_qc = Vector2.ZERO
+		var bake_rect := s.get_rect()
+		var bake_qc: Vector2 = bake_rect.position + bake_rect.size * 0.5
+		var delta: Vector2 = live_qc - bake_qc * vsxy
+		var wpos = source_mat.get_shader_param("sprite_world_pos")
+		var wrot = source_mat.get_shader_param("sprite_world_rot")
+		var wscale = source_mat.get_shader_param("sprite_world_scale")
+		if wpos is Vector2 and wscale is Vector2 and wrot != null:
+			mat.set_shader_param("sprite_world_pos", wpos + (delta * wscale).rotated(float(wrot)))
+	else:
+		mat.set_shader_param("poly_count", 0)
 	s.material = mat
 	return s
 
@@ -472,6 +522,9 @@ static func _extract_sprite(viewport: Viewport, shadow_sprite: Sprite, mod = nul
 	blend_mat.blend_mode = CanvasItemMaterial.BLEND_MODE_PREMULT_ALPHA
 	out.material = blend_mat
 	out.centered = shadow_sprite.centered
+	# Without the offset, the baked image (shadow + wall/path clip) is drawn
+	# displaced for any source sprite that has a non-zero Sprite.offset.
+	out.offset = shadow_sprite.offset
 	out.position = shadow_sprite.position
 	out.rotation = shadow_sprite.rotation
 	out.scale = shadow_sprite.scale

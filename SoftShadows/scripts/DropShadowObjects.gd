@@ -1029,26 +1029,13 @@ func _set_shadow_sprite_custom_rect(shadow_sprite, vertex_scale_xy: Vector2) -> 
 
 func _apply_clip_mask(obj, shadow_sprite, config: Dictionary):
 	"""Pass polyline clip data to shader."""
-	var clip_walls = config.get("clip_walls", false)
-	var clip_paths = config.get("clip_paths", false)
-	var obj_pos = obj.global_position
-	var offset = _compute_world_offset(config)
-	var shadow_center = obj_pos + offset
-
-	var shadow_radius = 200.0
-	if shadow_sprite != null and shadow_sprite.texture != null:
-		var tex_size = shadow_sprite.texture.get_size()
-		var mat = shadow_sprite.material as ShaderMaterial
-		if mat != null:
-			var vs = mat.get_shader_param("vertex_scale_xy")
-			var vsf = max(vs.x, vs.y) if vs is Vector2 else (float(vs) if vs != null else 0.0)
-			if vsf > 0:
-				shadow_radius = max(tex_size.x, tex_size.y) * vsf * shadow_sprite.global_scale.x * 0.5
-	shadow_radius += offset.length()
-
-	var polylines = _collect_clip_polylines(obj, clip_walls, clip_paths, shadow_radius, shadow_center)
+	var state = _clip_collect(obj, shadow_sprite, config)
+	var polylines = state["polylines"]
+	var obj_pos = state["obj_pos"]
+	var shadow_radius = state["radius"]
 	_clip_dbg("TOGGLE-collect", obj, polylines.size(), -1)
 	obj.set_meta("_shadow_clip_tex", true)
+	obj.set_meta("_clip_sig", state["sig"])
 	if polylines.size() == 0:
 		# Clear any existing clip data
 		var mat = shadow_sprite.material as ShaderMaterial
@@ -1094,7 +1081,15 @@ func _collect_clip_polylines(obj, clip_walls: bool, clip_paths: bool, max_clip_d
 							line = ch
 				if line == null or not is_instance_valid(line):
 					continue
+				# Dungeondraft splits a wall's Line2D children around its
+				# portals (doors/windows), so one Line2D only covers part of
+				# the wall. Use the wall's Points (full trace, portals
+				# included, same space as the Line2D points) so the shadow is
+				# stopped along the whole wall; fall back to the Line2D.
 				var points = line.points
+				var wall_points = wall.get("Points")
+				if wall_points != null and wall_points.size() >= 2:
+					points = wall_points
 				if points.size() < 2:
 					continue
 				var xform = line.global_transform
@@ -1661,31 +1656,141 @@ func _clip_should_recompute(obj, config: Dictionary) -> bool:
 	obj.set_meta("_clip_thr", {"pos": pos, "off": offset, "ms": now})
 	return true
 
-func _update_clip_planes(obj, shadow_sprite, config: Dictionary):
-	"""Lightweight update of clip polyline shader params."""
-	# Baked shadows are flat textures (no ShaderMaterial) — the clip is already
-	# burned into the texture. Bail BEFORE the (expensive) polyline collection so
-	# we don't iterate every wall/path each frame just to throw the result away.
-	if shadow_sprite == null or not (shadow_sprite.material is ShaderMaterial):
-		return
-	var clip_walls = config.get("clip_walls", false)
-	var clip_paths = config.get("clip_paths", false)
-	var obj_pos = obj.global_position
-	var offset = _compute_world_offset(config)
-	var shadow_center = obj_pos + offset
-
+# Clip search radius of a shadow. Works for a live shadow (ShaderMaterial on
+# the sprite) AND a baked one (shader material kept on the prop by ShadowBaker,
+# source texture read from the prop sprite) — both must return the same value,
+# or the baked/live clip signatures would never match (endless re-bake).
+func _clip_shadow_radius(obj, shadow_sprite, offset: Vector2) -> float:
 	var shadow_radius = 200.0
-	if shadow_sprite != null and shadow_sprite.texture != null:
-		var tex_size = shadow_sprite.texture.get_size()
-		var mat2 = shadow_sprite.material as ShaderMaterial
-		if mat2 != null:
-			var vs = mat2.get_shader_param("vertex_scale_xy")
+	if shadow_sprite != null and is_instance_valid(shadow_sprite):
+		var mat = shadow_sprite.material as ShaderMaterial
+		var tex = shadow_sprite.texture
+		if mat == null and _baker_script != null and obj.has_meta(_baker_script.META_SHADER_MAT):
+			mat = obj.get_meta(_baker_script.META_SHADER_MAT) as ShaderMaterial
+			var src = get_sprite(obj)
+			tex = src.texture if src != null else null
+		if mat != null and tex != null:
+			var tex_size = tex.get_size()
+			var vs = mat.get_shader_param("vertex_scale_xy")
 			var vsf = max(vs.x, vs.y) if vs is Vector2 else (float(vs) if vs != null else 0.0)
 			if vsf > 0:
 				shadow_radius = max(tex_size.x, tex_size.y) * vsf * shadow_sprite.global_scale.x * 0.5
-	shadow_radius += offset.length()
+	return shadow_radius + offset.length()
 
-	var polylines = _collect_clip_polylines(obj, clip_walls, clip_paths, shadow_radius, shadow_center)
+# Collects everything the clip depends on: polylines, object position, search
+# radius, plus a signature of the whole state (see _clip_signature).
+func _clip_collect(obj, shadow_sprite, config: Dictionary) -> Dictionary:
+	var obj_pos = obj.global_position
+	var offset = _compute_world_offset(config)
+	var shadow_radius = _clip_shadow_radius(obj, shadow_sprite, offset)
+	var polylines = _collect_clip_polylines(obj, config.get("clip_walls", false),
+			config.get("clip_paths", false), shadow_radius, obj_pos + offset)
+	return {
+		"polylines": polylines,
+		"obj_pos": obj_pos,
+		"radius": shadow_radius,
+		"sig": _clip_signature(shadow_sprite, polylines, obj_pos, shadow_radius),
+	}
+
+# Hash of the clip state sent to the shader. A baked shadow has this state
+# burned into its texture: a different signature means the bake is stale.
+# No polyline nearby = no clip at all, so the transform is irrelevant (0).
+func _clip_signature(shadow_sprite, polylines: Array, obj_pos: Vector2, shadow_radius: float) -> int:
+	if polylines.size() == 0:
+		return 0
+	var snap = Vector2(0.1, 0.1)
+	var parts = [obj_pos.snapped(snap), stepify(shadow_radius, 0.1)]
+	if shadow_sprite != null and is_instance_valid(shadow_sprite):
+		parts.append(shadow_sprite.global_position.snapped(snap))
+		parts.append(stepify(shadow_sprite.global_rotation, 0.0001))
+		parts.append(shadow_sprite.global_scale.snapped(Vector2(0.001, 0.001)))
+	for poly_data in polylines:
+		parts.append(poly_data[1])
+		for p in poly_data[0]:
+			parts.append(p.snapped(snap))
+	return hash(parts)
+
+# Periodic clip refresh for a placed object (called from the pre-draw scan,
+# throttled by _clip_should_recompute).
+#   Live shadow  : push the clip to the shader; if it changed while an auto-bake
+#                  is pending or rendering, restart the debounce so a stale
+#                  image is never installed.
+#   Baked shadow : compare the current clip state with the one burned into the
+#                  bake; if it changed (wall/path edited, object moved), unbake,
+#                  refresh the live clip and re-bake (AUTO) — or stay live in
+#                  the other bake modes, like a rotation does.
+func _clip_tick(obj, shadow_sprite, config: Dictionary):
+	var auto_bake = _bake_debounce != null and _should_auto_bake()
+	if config.get("shadow_mode", "offset") == "projected":
+		auto_bake = false  # projected shadows are never baked
+	var prev_sig = obj.get_meta("_clip_sig") if obj.has_meta("_clip_sig") else null
+
+	if _baker_script == null or not _baker_script.is_baked(obj, SHADOW_META_KEY):
+		_update_clip_planes(obj, shadow_sprite, config)
+		if auto_bake and prev_sig != null and obj.get_meta("_clip_sig") != prev_sig:
+			_bake_debounce.schedule_bake(obj)
+		return
+
+	var state = _clip_collect(obj, shadow_sprite, config)
+	if prev_sig != null and state["sig"] == prev_sig:
+		return
+	if auto_bake:
+		_bake_debounce.schedule_bake(obj)  # unbakes immediately + debounced rebake
+	else:
+		var src = get_sprite(obj)
+		if src != null:
+			_baker_script.unbake(obj, SHADOW_META_KEY, src)
+	# unbake() reuses the same Sprite node, now back on its ShaderMaterial.
+	_update_clip_planes(obj, shadow_sprite, config)
+
+# Idle-context entry point for _clip_tick (deferred from the pre-draw scan):
+# re-resolves everything from the object, which may have changed or been freed.
+func _clip_tick_deferred(obj) -> void:
+	if obj == null or not is_instance_valid(obj):
+		return
+	if not obj.has_meta(SHADOW_META_KEY) or not obj.has_meta("_shadow_config"):
+		return
+	var cfg = obj.get_meta("_shadow_config")
+	if not (cfg is Dictionary):
+		return
+	if not (cfg.get("clip_walls", false) or cfg.get("clip_paths", false)):
+		return
+	var nodes = obj.get_meta(SHADOW_META_KEY)
+	if not (nodes is Array) or nodes.size() == 0:
+		return
+	var shadow_sprite = nodes[0]
+	if shadow_sprite == null or not is_instance_valid(shadow_sprite):
+		return
+	_clip_tick(obj, shadow_sprite, cfg)
+
+# Called right before a manual / batch bake: refreshes the clip on the live
+# shader so the bake burns the current walls/paths, and returns the signature
+# of that state (null when the shadow isn't clipped). The caller writes it back
+# after installing the bake, so a clip change landing mid-bake is caught by the
+# next _clip_tick instead of leaving a stale image.
+func _clip_prepare_bake(obj, shadow_sprite):
+	if not obj.has_meta("_shadow_clip_tex") or not obj.has_meta("_shadow_config"):
+		return null
+	var cfg = obj.get_meta("_shadow_config")
+	if not (cfg is Dictionary):
+		return null
+	if not (cfg.get("clip_walls", false) or cfg.get("clip_paths", false)):
+		return null
+	_update_clip_planes(obj, shadow_sprite, cfg)
+	return obj.get_meta("_clip_sig") if obj.has_meta("_clip_sig") else null
+
+func _update_clip_planes(obj, shadow_sprite, config: Dictionary):
+	"""Lightweight update of clip polyline shader params."""
+	# Baked shadows are flat textures (no ShaderMaterial) — the clip is burned
+	# into the texture, nothing to push here. Clip changes on a baked shadow are
+	# detected by _clip_tick, which unbakes before calling this.
+	if shadow_sprite == null or not (shadow_sprite.material is ShaderMaterial):
+		return
+	var state = _clip_collect(obj, shadow_sprite, config)
+	var polylines = state["polylines"]
+	var obj_pos = state["obj_pos"]
+	var shadow_radius = state["radius"]
+	obj.set_meta("_clip_sig", state["sig"])
 	_clip_dbg("TICK-collect", obj, polylines.size(), -1)
 
 	var mat = shadow_sprite.material as ShaderMaterial
@@ -1715,6 +1820,8 @@ func remove_shadow(obj):
 		obj.remove_meta(SHADOW_META_KEY)
 	if obj.has_meta("_shadow_clip_tex"):
 		obj.remove_meta("_shadow_clip_tex")
+	if obj.has_meta("_clip_sig"):
+		obj.remove_meta("_clip_sig")
 	if obj.has_meta("_shadow_source_tex_rid"):
 		obj.remove_meta("_shadow_source_tex_rid")
 
@@ -1765,6 +1872,7 @@ func bake_object_now(obj):
 	var source_sprite = get_sprite(obj)
 	if source_sprite == null:
 		return
+	var clip_sig = _clip_prepare_bake(obj, shadow_sprite)
 	var baked = yield(_baker_script.bake_shadow(shadow_sprite, source_sprite, global, self), "completed")
 	if baked == null:
 		return
@@ -1772,6 +1880,8 @@ func bake_object_now(obj):
 		baked.queue_free()
 		return
 	_baker_script.install_baked(obj, shadow_sprite, baked, SHADOW_META_KEY)
+	if clip_sig != null:
+		obj.set_meta("_clip_sig", clip_sig)
 
 
 # Single bake queue, drained in WAVES. Overlapping callers (map-load + enable,
@@ -1872,6 +1982,8 @@ func _drain_bake_queue():
 				baked.queue_free()
 				continue
 			_baker_script.install_baked(obj, shadow_sprite, baked, SHADOW_META_KEY)
+			if entries[i].get("clip_sig") != null:
+				obj.set_meta("_clip_sig", entries[i]["clip_sig"])
 			done += 1
 		_bake_progress_update()
 		# Give the freed viewports a frame to release their memory before the
@@ -1914,7 +2026,8 @@ func _make_bake_entry(obj):
 	var vp_size = _baker_script.compute_viewport_size(shadow_sprite, source_sprite)
 	if vp_size == Vector2.ZERO:
 		return null
-	return {"obj": obj, "shadow_sprite": shadow_sprite, "source_sprite": source_sprite, "vp_size": vp_size}
+	return {"obj": obj, "shadow_sprite": shadow_sprite, "source_sprite": source_sprite, "vp_size": vp_size,
+			"clip_sig": _clip_prepare_bake(obj, shadow_sprite)}
 
 
 # Centered "Baking shadows" popup for the wave bake queue. Same visual style as
@@ -2640,7 +2753,14 @@ func _update_all_shadow_rotations():
 				var shadow_sprite = nodes[0]
 				if is_instance_valid(shadow_sprite):
 					if _clip_should_recompute(obj, config):
-						_update_clip_planes(obj, shadow_sprite, config)
+						# A baked shadow may need an unbake (texture/material
+						# swap), which is unsafe inside frame_pre_draw — defer
+						# it like the rotation refresh. Live shadows only get
+						# shader params: keep them here (no 1-frame clip lag).
+						if _baker_script != null and _baker_script.is_baked(obj, SHADOW_META_KEY):
+							call_deferred("_clip_tick_deferred", obj)
+						else:
+							_clip_tick(obj, shadow_sprite, config)
 
 	# Also sync ObjectTool preview shadow (not in _all_known_obj_ids).
 	# Same simple logic as placed objects: shadow is a child, position only —
@@ -4486,7 +4606,7 @@ func _update_proj_dial_from_mouse(pos: Vector2, dial: Control):
 			var sun_ang = rad2deg(atan2(delta.y, delta.x))
 			if sun_ang < 0.0:
 				sun_ang += 360.0
-			ui_config["proj_sun_angle_spin"].value = round(sun_ang)
+			ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(sun_ang)
 		_syncing_ui = false
 		apply_shadow_to_selected(false, ["proj_angle", "proj_length"])
 		return
@@ -4541,12 +4661,21 @@ func _on_proj_fade_reset():
 
 func _apply_proj_from_spins() -> void:
 	var length = clamp(ui_config["proj_dist_spin"].value, 0.0, PROJ_MAX_LENGTH)
-	var sun_ang = ui_config["proj_sun_angle_spin"].value
+	var sun_ang = _sun_screen_from_ui(ui_config["proj_sun_angle_spin"].value)
 	var frac = _proj_frac_from_len(length)
 	var lr = deg2rad(sun_ang)
 	if ui_config.has("proj_dir_dial"):
 		_set_proj_dial_handle(ui_config["proj_dir_dial"], Vector2(cos(lr), sin(lr)) * frac)
 	apply_shadow_to_selected(false, ["proj_angle", "proj_length"])
+
+# Projected UI angle uses the same convention as Offset mode:
+# 0 deg = sun north, 90 deg = east, clockwise. Internals (dial handle, snap
+# angles, proj_angle) stay in screen convention (0 deg = east, 90 deg = south).
+func _sun_ui_from_screen(deg: float) -> float:
+	return fposmod(round(deg + 90.0), 360.0)
+
+func _sun_screen_from_ui(deg: float) -> float:
+	return fposmod(deg - 90.0, 360.0)
 
 func _proj_len_from_frac(frac: float) -> float:
 	# Dial radius fraction (0..1) -> projection length, non-linear (see PROJ_DIAL_EXP).
@@ -4601,7 +4730,7 @@ func _on_proj_angle_changed(_v = null):
 	if snap >= 0.0:
 		# Angle is locked by an active snap button: revert manual edits.
 		_syncing_ui = true
-		ui_config["proj_sun_angle_spin"].value = round(snap)
+		ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(snap)
 		_syncing_ui = false
 		return
 	_apply_proj_from_spins()
@@ -4638,7 +4767,7 @@ func _on_proj_snap_toggled(pressed, key, sun_screen_angle):
 		for k in ["proj_snap_45", "proj_snap_135", "proj_snap_225", "proj_snap_315"]:
 			if k != key and ui_config.has(k):
 				ui_config[k].pressed = false
-		ui_config["proj_sun_angle_spin"].value = round(sun_screen_angle)
+		ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(sun_screen_angle)
 		_syncing_ui = false
 		if ui_config.has("proj_dir_dial"):
 			ui_config["proj_dir_dial"].set_meta("snap_angle", sun_screen_angle)
@@ -5783,7 +5912,7 @@ func _apply_proj_ui_from_config(cfg: Dictionary) -> void:
 	if sun_deg < 0.0:
 		sun_deg += 360.0
 	if ui_config.has("proj_sun_angle_spin"):
-		ui_config["proj_sun_angle_spin"].value = round(sun_deg)
+		ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(sun_deg)
 	_deactivate_all_proj_snaps()
 	if ui_config.has("proj_dir_dial"):
 		var frac2 = _proj_frac_from_len(plen)
@@ -5911,7 +6040,7 @@ func get_current_shadow_config() -> Dictionary:
 		"clip_paths": ui_config["clip_paths_check"].pressed,
 		"snap_angle": snap,
 		"shadow_mode": ("projected" if (ui_config.has("mode_opt") and ui_config["mode_opt"].selected >= 1) else "offset"),
-		"proj_angle": (deg2rad(fmod(ui_config["proj_sun_angle_spin"].value + 180.0, 360.0)) if ui_config.has("proj_sun_angle_spin") else 0.0),
+		"proj_angle": (deg2rad(fmod(_sun_screen_from_ui(ui_config["proj_sun_angle_spin"].value) + 180.0, 360.0)) if ui_config.has("proj_sun_angle_spin") else 0.0),
 		"proj_length": (ui_config["proj_dist_spin"].value if ui_config.has("proj_dist_spin") else 0.0),
 		"proj_anchor_x": (ui_config["proj_anchor_x_spin"].value if ui_config.has("proj_anchor_x_spin") else 0.0),
 		"proj_anchor_y": (ui_config["proj_anchor_y_spin"].value if ui_config.has("proj_anchor_y_spin") else 0.0),
@@ -6195,7 +6324,7 @@ func load_shadow_ui_from_object(obj):
 	if sun_deg < 0.0:
 		sun_deg += 360.0
 	if ui_config.has("proj_sun_angle_spin"):
-		ui_config["proj_sun_angle_spin"].value = round(sun_deg)
+		ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(sun_deg)
 	_deactivate_all_proj_snaps()
 	if ui_config.has("proj_dir_dial"):
 		# Handle points to the SUN (opposite the shadow). Radius encodes length.
@@ -6322,7 +6451,7 @@ func overlay_drive_sun(node, sun_deg: float, frac: float, angle_only: bool) -> b
 		if not angle_only:
 			ui_config["proj_dist_spin"].value = _proj_len_from_frac(frac)
 			_proj_dist_prev = ui_config["proj_dist_spin"].value
-		ui_config["proj_sun_angle_spin"].value = round(fposmod(sun_deg, 360.0))
+		ui_config["proj_sun_angle_spin"].value = _sun_ui_from_screen(sun_deg)
 		_syncing_ui = false
 		_apply_proj_from_spins()
 	return true
@@ -6389,6 +6518,53 @@ func set_shadow_enabled(nodes, enabled: bool) -> void:
 		if enabled:
 			create_shadow(node, cfg)
 		save_shadow_data(node, cfg)
+
+#########################################################################################################
+## SHARED SETTINGS API (SelectionShadowToggle — mixed-selection panel)
+#########################################################################################################
+# The mixed-selection panel edits the settings every selected asset type has
+# in common. It reads each node's saved config and hands back, per node, only
+# the keys that changed (already converted to this module's own ranges).
+
+func shared_type() -> String:
+	return "objects"
+
+# Saved config of a node whose shadow is ON (colors as Color), else null.
+func shared_saved_config(node):
+	if not has_shadow_enabled(node):
+		return null
+	var cfg = global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))].duplicate()
+	if cfg.has("shadow_color") and cfg["shadow_color"] is String:
+		cfg["shadow_color"] = Color(cfg["shadow_color"])
+	return cfg
+
+# entries = [[node, {key: value}], ...]. The special key "__offset" = [ox, oy]
+# (world px) goes through set_shadow_offset (handles Offset AND Projected).
+# Nodes without an enabled shadow are skipped. One history transaction.
+func shared_apply(entries: Array) -> void:
+	var targets = []
+	for e in entries:
+		if has_shadow_enabled(e[0]):
+			targets.append(e)
+	if targets.empty():
+		return
+	_history_touch("shared")
+	for e in targets:
+		var node = e[0]
+		var changes = e[1].duplicate()
+		var offset = changes.get("__offset", null)
+		changes.erase("__offset")
+		if not changes.empty():
+			var cfg = shared_saved_config(node)
+			for k in changes.keys():
+				cfg[k] = changes[k]
+			if cfg.get("custom_layer", false):
+				cfg["shadow_layer"] = _clamped_shadow_layer(node, cfg)
+			remove_shadow(node)
+			create_shadow(node, cfg)
+			save_shadow_data(node, cfg)
+		if offset != null:
+			set_shadow_offset(node, float(offset[0]), float(offset[1]))
 
 #########################################################################################################
 ## OFFSET API (GlobalIllumination) — read / write one shadow's offset by data

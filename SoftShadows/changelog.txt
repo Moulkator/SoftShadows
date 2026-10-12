@@ -1,5 +1,12 @@
 SOFT SHADOWS
 
+v1.7.5
+- Added a better multi-type selection support
+- Added the ability to choose only one of the ends with the Wrap Ends option (walls and paths in realistic mode)
+- Added "Crop at Center" by default for walls and paths in Realistic Mod (one side only)
+- Fixed "blocked by" feature not working in Bake rendering
+- Fixed incorrect angle in Projected Mode (objects)
+
 v1.7.4
 - Added a new "Bevel" style for Overlay Shadows on objects. The previous overlay is now the "Gradient" style.
 - New objects overlays use the Bevel style by default (existing overlays stay in Gradient)

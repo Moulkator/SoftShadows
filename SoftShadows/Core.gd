@@ -285,6 +285,9 @@ func initialise_dropshadow():
 		# Let the level-settings patch mask/grey object overlays on disabled levels.
 		if level_settings_patch != null:
 			level_settings_patch.overlay_shadow_objects = overlay_shadow_objects
+		# Global Illumination drives the overlays' sun (set_global_sun API).
+		if global_illumination != null:
+			global_illumination.modules["overlays_objects"] = overlay_shadow_objects
 	else:
 		outputlog("Warning: OverlayShadowObjects.gd not found, overlay shadows disabled", 0)
 
@@ -322,6 +325,8 @@ func initialise_dropshadow():
 		Global.ModMapData["_dropshadow_refs"]["overlay_patterns"] = overlay_shadow_patterns
 		if level_settings_patch != null:
 			level_settings_patch.overlay_shadow_patterns = overlay_shadow_patterns
+		if global_illumination != null:
+			global_illumination.modules["overlays_patterns"] = overlay_shadow_patterns
 	else:
 		outputlog("Warning: OverlayShadowPatterns.gd not found, pattern overlays disabled", 0)
 

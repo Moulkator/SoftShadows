@@ -30,8 +30,9 @@ const FACTORY_DEFAULTS = {
 	"offset_y": 0.0,
 	"offset_angle": 0.0,          # angle du dial d'offset (deg) ; sert au bombage lié si offset nul
 	"radial_offset": 0.0,
-	"crop_blur": false,
+	"crop_blur": true,   # Crop at Center ON by default (only applies in Realistic, Side A/B)
 	"crop_ends": false,
+	"wrap_which": 2,   # Wrap Ends ON: 0 = wrap the start only, 1 = the end only, 2 = both
 	"side_balance": 0.0,
 	"range": 1.0,
 	"snap_angle": -1.0,
@@ -525,8 +526,9 @@ func _live_update_realistic(path, cfg: Dictionary, changed = []) -> bool:
 	var blur_px = _realistic_blur_px(cfg, line)
 	_realistic_spread_px_cur = _realistic_spread_px(cfg, line)
 	# Keep the crop_ends stash fresh for the live builders (cfg is the live truth here).
-	_path_crop_ends_cfg[path.get_instance_id()] = cfg.get("crop_ends", false)
+	_path_crop_ends_cfg[path.get_instance_id()] = _ends_cut_flags(cfg)
 	_realistic_end_ext_cur = _realistic_end_ext_px(path, line, blur_px)
+	_realistic_end_cut_cur = _path_cut_flags(path)
 	var want_blur = blur_px >= REALISTIC_MIN_BLUR_PX
 	var offset = Vector2(cfg.get("offset_x", 0.0), cfg.get("offset_y", 0.0))
 	offset = line.global_transform.affine_inverse().basis_xform(offset)
@@ -2830,6 +2832,22 @@ func build_select_tool_ui():
 	ui_config["crop_ends_check"] = cends_check
 	ui_config["crop_ends_hbox"] = cends_hbox
 	settings_panel.add_child(cends_hbox)
+	# Wrap Ends ON: which ends wrap (the other one is cut straight). Realistic only.
+	var wrap_which_hbox = HBoxContainer.new()
+	wrap_which_hbox.visible = false
+	var wrap_names = ["Start", "End", "Both"]
+	for i in range(3):
+		var wbtn = Button.new()
+		wbtn.text = " " + wrap_names[i]
+		wbtn.toggle_mode = true
+		wbtn.pressed = (i == int(DEFAULT_SHADOW_CONFIG.get("wrap_which", 2)))
+		wbtn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		wbtn.align = Button.ALIGN_LEFT
+		wbtn.connect("pressed", self, "_on_wrap_which_pressed", [i])
+		wrap_which_hbox.add_child(wbtn)
+		ui_config["wrap_which_btn_" + str(i)] = wbtn
+	settings_panel.add_child(wrap_which_hbox)
+	ui_config["wrap_which_hbox"] = wrap_which_hbox
 
 	# -- Behind Layer: toggle to render the shadow below ALL paths on the
 	# level (not just behind its own path texture). Detaches the mesh from
@@ -4236,10 +4254,37 @@ func _on_crop_blur_toggled(_pressed):
 	apply_shadow_to_selected_paths()
 
 func _on_crop_ends_toggled(_pressed):
+	_update_crop_blur_visibility()
 	if _syncing_ui:
 		return
 	# Pas un param "live" -> force le rebuild complet (le masque doit être (re)capturé).
 	_last_changed_params = ["crop_ends"]
+	apply_shadow_to_selected_paths()
+
+func _set_wrap_which_buttons(active_index: int):
+	for i in range(3):
+		var key = "wrap_which_btn_" + str(i)
+		if not ui_config.has(key):
+			continue
+		var btn = ui_config[key]
+		btn.pressed = (i == active_index)
+		btn.icon = btn.get_icon("radio_checked" if i == active_index else "radio_unchecked", "CheckBox")
+
+func _get_selected_wrap_which() -> int:
+	for i in range(3):
+		var key = "wrap_which_btn_" + str(i)
+		if ui_config.has(key) and ui_config[key].pressed:
+			return i
+	return 2
+
+func _on_wrap_which_pressed(which_index):
+	var was_syncing = _syncing_ui
+	_syncing_ui = true
+	_set_wrap_which_buttons(which_index)
+	_syncing_ui = was_syncing
+	if was_syncing:
+		return
+	_last_changed_params = ["wrap_which"]
 	apply_shadow_to_selected_paths()
 
 func _update_crop_blur_visibility():
@@ -4251,6 +4296,8 @@ func _update_crop_blur_visibility():
 	# Crop Ends : Realistic, toute direction (y compris Both).
 	if ui_config.has("crop_ends_hbox"):
 		ui_config["crop_ends_hbox"].visible = realistic
+	if ui_config.has("wrap_which_hbox"):
+		ui_config["wrap_which_hbox"].visible = realistic and ui_config["crop_ends_check"].pressed
 
 func _set_render_mode_buttons(active_index: int):
 	# Remembered so re-clicking the active mode does not swap opacities.
@@ -5069,6 +5116,7 @@ func get_current_shadow_config() -> Dictionary:
 		"offset_angle": ui_config["angle_spin"].value if ui_config.has("angle_spin") else 0.0,
 		"crop_blur": (ui_config["crop_blur_check"].pressed if ui_config.has("crop_blur_check") else false),
 		"crop_ends": ((not ui_config["crop_ends_check"].pressed) if ui_config.has("crop_ends_check") else false),   # Wrap Ends OFF = straight cut
+		"wrap_which": _get_selected_wrap_which(),
 		"radial_offset": ui_config["radial_offset_spin"].value if ui_config.has("radial_offset_spin") else DEFAULT_SHADOW_CONFIG["radial_offset"],
 		"side_balance": ui_config["side_balance_spin"].value if ui_config.has("side_balance_spin") else DEFAULT_SHADOW_CONFIG["side_balance"],
 		"range": ui_config["range_spin"].value if ui_config.has("range_spin") else DEFAULT_SHADOW_CONFIG["range"],
@@ -6159,7 +6207,7 @@ func create_shadow(path, config: Dictionary):
 	# Stash crop_ends : les builders realistic (bake/live) n'ont pas la config et la
 	# lisaient dans ModMapData, sauvegardé APRÈS create_shadow -> toggle décalé d'un
 	# cran. Le stash porte la valeur FRAÎCHE.
-	_path_crop_ends_cfg[path.get_instance_id()] = config.get("crop_ends", false)
+	_path_crop_ends_cfg[path.get_instance_id()] = _ends_cut_flags(config)
 
 	# Mode "Realistic" (B) : silhouette texturée décalée, rendue sous le path.
 	if config.get("render_mode", "simple") == "realistic":
@@ -6774,6 +6822,7 @@ func create_realistic_shadow(path, config: Dictionary, line = null):
 	var blur_px = _realistic_blur_px(config, line)
 	_realistic_spread_px_cur = _realistic_spread_px(config, line)
 	_realistic_end_ext_cur = _realistic_end_ext_px(path, line, blur_px)
+	_realistic_end_cut_cur = _path_cut_flags(path)
 	var do_blur = blur_px >= REALISTIC_MIN_BLUR_PX
 
 	# Décalage monde -> local (rotation ET miroir/scale du path)
@@ -6868,8 +6917,11 @@ func _copy_line_props(dst, src, bulge = null, radial = null):
 	if ext_pts > 0:
 		# The extension already runs past the cap; a cap on the copy would only poke
 		# out of the crop mask.
-		dst.begin_cap_mode = Line2D.LINE_CAP_NONE
-		dst.end_cap_mode = Line2D.LINE_CAP_NONE
+		# A wrapped end (Wrap Ends Start / End) keeps its cap.
+		if _realistic_end_cut_cur[0]:
+			dst.begin_cap_mode = Line2D.LINE_CAP_NONE
+		if _realistic_end_cut_cur[1]:
+			dst.end_cap_mode = Line2D.LINE_CAP_NONE
 	dst.sharp_limit = src.sharp_limit
 	dst.round_precision = src.round_precision
 	dst.antialiased = src.antialiased
@@ -7062,16 +7114,31 @@ func _crop_tint_mat_ends() -> ShaderMaterial:
 # en priorité, config SAUVÉE en repli (ModMapData est sauvegardé APRÈS create_shadow
 # dans apply_shadow_to_selected_paths -> lu seul, il retarde le toggle d'un cran).
 var _path_crop_ends_cfg = {}
+# True when at least one end is cut (see _ends_cut_flags).
 func _path_cfg_crop_ends(path) -> bool:
+	var f = _path_cut_flags(path)
+	return f[0] or f[1]
+
+func _path_cut_flags(path) -> Array:
 	if path == null or not is_instance_valid(path):
-		return false
+		return [false, false]
 	var iid = path.get_instance_id()
 	if _path_crop_ends_cfg.has(iid):
 		return _path_crop_ends_cfg[iid]
 	if not path.has_meta("node_id") or not global.ModMapData.has(SHADOW_DATA_KEY):
-		return false
-	var d = global.ModMapData[SHADOW_DATA_KEY].get(str(path.get_meta("node_id")))
-	return d != null and d.get("crop_ends", false)
+		return [false, false]
+	return _ends_cut_flags(global.ModMapData[SHADOW_DATA_KEY].get(str(path.get_meta("node_id"))))
+
+# [cut_start, cut_end] of the Realistic end crop. crop_ends (Wrap Ends OFF) cuts
+# both ends; Wrap Ends ON with wrap_which Start / End wraps that end only and cuts
+# the other one straight; Both wraps both ends (no cut).
+func _ends_cut_flags(d) -> Array:
+	if d == null:
+		return [false, false]
+	if d.get("crop_ends", false):
+		return [true, true]
+	var w = int(d.get("wrap_which", 2))
+	return [w == 1, w == 0]
 
 func _path_ends_on(path, blur_px, closed) -> bool:
 	if closed:
@@ -7089,9 +7156,10 @@ func _populate_path_end_crop(mcont, pts, reach, line):
 	var ends = []
 	var t0 = pts[1] - pts[0]
 	var t1 = pts[pts.size() - 1] - pts[pts.size() - 2]
-	if t0.length() > 0.001:
+	var cut = _path_cut_flags(line)   # Wrap Ends Start / End: only the other end is cut
+	if t0.length() > 0.001 and cut[0]:
 		ends.append({"p": pts[0], "t": -t0.normalized(), "cap": line.begin_cap_mode != Line2D.LINE_CAP_NONE})
-	if t1.length() > 0.001:
+	if t1.length() > 0.001 and cut[1]:
 		ends.append({"p": pts[pts.size() - 1], "t": t1.normalized(), "cap": line.end_cap_mode != Line2D.LINE_CAP_NONE})
 	for e in ends:
 		var c = e["p"] + e["t"] * (w2 if e["cap"] else 0.0)
@@ -7301,6 +7369,10 @@ var _realistic_spread_px_cur = 0.0   # dilation used while building the current 
 # so the blur is fully saturated up to the cap; the end-crop mask then cuts it flat.
 # 0 = no extension (Crop Ends off, sharp copy, closed loop). Set per build, like spread.
 var _realistic_end_ext_cur = 0.0
+# Which ends that extension applies to ([start, end], see _ends_cut_flags). A
+# wrapped end only gets a tiny collinear step so the copy keeps its point layout.
+var _realistic_end_cut_cur = [true, true]
+const WRAPPED_END_EXT = 0.01
 
 func _realistic_end_ext_px(path, line, blur_px) -> float:
 	if line == null or not is_instance_valid(line):
@@ -7317,10 +7389,12 @@ func _extend_open_points(pts: PoolVector2Array, ext: float) -> PoolVector2Array:
 	var t1 = pts[pts.size() - 1] - pts[pts.size() - 2]
 	if t0.length() < 0.001 or t1.length() < 0.001:
 		return pts
+	var es = ext if _realistic_end_cut_cur[0] else WRAPPED_END_EXT
+	var ee = ext if _realistic_end_cut_cur[1] else WRAPPED_END_EXT
 	var out = PoolVector2Array()
-	out.append(pts[0] - t0.normalized() * ext)
+	out.append(pts[0] - t0.normalized() * es)
 	out.append_array(pts)
-	out.append(pts[pts.size() - 1] + t1.normalized() * ext)
+	out.append(pts[pts.size() - 1] + t1.normalized() * ee)
 	return out
 
 # Tiling compensation for the extended copy: [scale, offset] such that
@@ -7335,7 +7409,8 @@ func _uv_x_ext_for(line, ext: float) -> Array:
 		var aspect = 1.0
 		if line.texture != null and line.texture.get_height() > 0:
 			aspect = float(line.texture.get_width()) / float(line.texture.get_height())
-		return [1.0, ext / (line.width * aspect)]
+		var es_t = ext if _realistic_end_cut_cur[0] else WRAPPED_END_EXT
+		return [1.0, es_t / (line.width * aspect)]
 	if line.texture_mode == Line2D.LINE_TEXTURE_STRETCH:
 		var L = 0.0
 		var pts = line.points
@@ -7343,7 +7418,9 @@ func _uv_x_ext_for(line, ext: float) -> Array:
 			L += (pts[i] - pts[i - 1]).length()
 		if L <= 0.001:
 			return [1.0, 0.0]
-		return [(L + 2.0 * ext) / L, ext / L]
+		var es_s = ext if _realistic_end_cut_cur[0] else WRAPPED_END_EXT
+		var ee_s = ext if _realistic_end_cut_cur[1] else WRAPPED_END_EXT
+		return [(L + es_s + ee_s) / L, es_s / L]
 	return [1.0, 0.0]
 
 func _realistic_blur_px(config: Dictionary, line) -> float:
@@ -8064,6 +8141,7 @@ func _process_realistic_live_settle():
 func _convert_realistic_live_to_static(nid, path, line, offset, shadow_color, opacity, behind_layer, blur_px, gen, bulge = null, radial = null):
 	# Crop Ends extension is per-path state: refresh it for this path before the bake.
 	_realistic_end_ext_cur = _realistic_end_ext_px(path, line, blur_px)
+	_realistic_end_cut_cur = _path_cut_flags(path)
 	# Boucle+radial : le static doit refaire l'ombre via la coroutine boucle (mesh qui
 	# échantillonne le bitmap naturel), pas le bake arc-longueur des paths ouverts.
 	if radial != null and bulge == null and _is_line_closed(line):
@@ -8408,6 +8486,14 @@ func _reparent_ui_to_node(node):
 	var target_parent = ui_config.get("_path_parent")
 	if target_parent == null:
 		return
+	# Multi-type selection (e.g. walls + paths in a drag box, where DD still shows
+	# the Path options): the shared "Soft Shadows" section takes over — hide this
+	# one, so its settings can't apply to this type only.
+	var sst = core.get("selection_shadow_toggle") if core != null else null
+	if sst != null and sst.has_method("is_multi_type_selection") and sst.is_multi_type_selection():
+		if container.get_parent() != null:
+			container.get_parent().remove_child(container)
+		return
 	if container.get_parent() == target_parent:
 		_position_container_above_cmt(target_parent, container)
 		_update_transition_visibility("paths")
@@ -8594,6 +8680,7 @@ func set_ui_without_signals(config: Dictionary):
 		ui_config["crop_blur_check"].pressed = config.get("crop_blur", false)
 	if ui_config.has("crop_ends_check"):
 		ui_config["crop_ends_check"].pressed = not config.get("crop_ends", false)   # Wrap Ends = inverse of crop_ends
+		_set_wrap_which_buttons(int(config.get("wrap_which", 2)))
 	_update_crop_blur_visibility()
 	ui_config["softness_slider"].value = config.get("softness", DEFAULT_SHADOW_CONFIG["softness"])
 	ui_config["softness_spin"].value = config.get("softness", DEFAULT_SHADOW_CONFIG["softness"])
@@ -8853,6 +8940,82 @@ func set_shadow_enabled(nodes, enabled: bool) -> void:
 			cfg["shadow_layer"] = _clamped_shadow_layer(node, cfg)
 		remove_shadow(node)
 		if enabled:
+			create_shadow(node, cfg)
+		save_shadow_data(node, cfg)
+		_apply_custom_layer_z(node, cfg)
+
+#########################################################################################################
+## SHARED SETTINGS API (SelectionShadowToggle — mixed-selection panel)
+#########################################################################################################
+# The mixed-selection panel edits the settings every selected asset type has
+# in common. It reads each node's saved config and hands back, per node, only
+# the keys that changed (already converted to this module's own ranges).
+
+func shared_type() -> String:
+	return "paths"
+
+# Saved config of a node whose shadow is ON (colors as Color), else null.
+func shared_saved_config(node):
+	if not has_shadow_enabled(node):
+		return null
+	var cfg = global.ModMapData[SHADOW_DATA_KEY][str(node.get_meta("node_id"))].duplicate()
+	if cfg.has("shadow_color") and cfg["shadow_color"] is String:
+		cfg["shadow_color"] = Color(cfg["shadow_color"])
+	return cfg
+
+# entries = [[node, {key: value}], ...]. The special key "__offset" = [ox, oy]
+# (world px) is written as offset_x / offset_y (dial range widened if needed).
+# Nodes without an enabled shadow are skipped. One history transaction.
+# Realistic shadows take the same live / deferred paths as the per-type panel
+# (no viewport recapture on every slider tick).
+func shared_apply(entries: Array) -> void:
+	var targets = []
+	for e in entries:
+		if has_shadow_enabled(e[0]):
+			targets.append(e)
+	if targets.empty():
+		return
+	_history_touch("shared")
+	for e in targets:
+		var node = e[0]
+		var changes = e[1].duplicate()
+		if changes.has("__offset"):
+			var off = changes["__offset"]
+			changes.erase("__offset")
+			changes["offset_x"] = round(float(off[0]))
+			changes["offset_y"] = round(float(off[1]))
+		var cfg = shared_saved_config(node)
+		for k in changes.keys():
+			cfg[k] = changes[k]
+		if changes.has("offset_x"):
+			var need = ceil(max(abs(cfg["offset_x"]), abs(cfg["offset_y"])) / OFFSET_MAX)
+			if need > float(cfg.get("range", 1.0)):
+				cfg["range"] = need
+		if cfg.get("custom_layer", false):
+			cfg["shadow_layer"] = _clamped_shadow_layer(node, cfg)
+		var realistic = cfg.get("render_mode", "simple") == "realistic"
+		# Param names as the per-type panel reports them.
+		var changed = []
+		for k in changes.keys():
+			if k == "opacity_realistic":
+				k = "opacity"
+			if k == "slider_style" and realistic:
+				continue
+			if not changed.has(k):
+				changed.append(k)
+		var has_shadow = node.has_meta(SHADOW_META_KEY)
+		if has_shadow and _can_live_update_realistic(changed, cfg):
+			if not _live_update_realistic(node, cfg, changed):
+				create_shadow(node, cfg)
+		elif has_shadow and _can_fast_update(changed, cfg):
+			if not _fast_update_shadow(node, cfg):
+				remove_shadow(node)
+				create_shadow(node, cfg)
+		elif realistic and has_shadow:
+			# Atomic swap inside the realistic builders: no pre-removal.
+			create_shadow(node, cfg)
+		else:
+			remove_shadow(node)
 			create_shadow(node, cfg)
 		save_shadow_data(node, cfg)
 		_apply_custom_layer_z(node, cfg)
