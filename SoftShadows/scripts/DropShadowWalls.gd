@@ -1184,6 +1184,19 @@ func _refresh_wall_shadow(wall):
 		return
 	var config = global.ModMapData[SHADOW_DATA_KEY][node_id]
 	if config.get("enabled", false):
+		# Realistic : suivi en direct (session live, re-bake au repos). Un remove + recapture à
+		# chaque image d'Edit Points était annulé par la suivante avant d'aboutir -> l'ombre restait
+		# figée jusqu'au relâchement de la souris.
+		if config.get("render_mode", "simple") == "realistic" and wall.has_meta(SHADOW_META_KEY):
+			# capture en vol : le scan reprendra le mur ensuite (hash inchangé ici)
+			if _wall_r_capturing.has(wall.get_instance_id()):
+				return
+			var cfg = config.duplicate()
+			if cfg.has("shadow_color") and cfg["shadow_color"] is String:
+				cfg["shadow_color"] = Color(cfg["shadow_color"])
+			_wall_r_follow_and_settle(wall, cfg)
+			_all_points_hashes[node_id] = _get_points_hash(wall)
+			return
 		remove_shadow(wall)
 		create_shadow(wall, config)
 		_all_points_hashes[node_id] = _get_points_hash(wall)
@@ -1509,6 +1522,14 @@ func _history_force_resync() -> void:
 				if is_instance_valid(n):
 					n.visible = false
 
+func _wall_own_child_count(path) -> int:
+	var count = 0
+	for c in path.get_children():
+		if c is Viewport or str(c.name) == "DropShadowRealisticWrap":
+			continue
+		count += 1
+	return count
+
 func _get_points_hash(path) -> int:
 	if path == null or not is_instance_valid(path):
 		return 0
@@ -1527,7 +1548,11 @@ func _get_points_hash(path) -> int:
 			if ch is Line2D and ch.width == tex_width and ch.get_point_count() >= 2:
 				for p in ch.points:
 					h = h * 31 + int(p.x * 10) + int(p.y * 10) * 7
-		h = h * 31 + path.get_child_count()
+		# enfants du mur, hors ceux du mod (ombre realistic et ses viewports de capture, logés dans
+		# le mur) : sinon chaque capture changeait le hash et relançait une capture -> flicker en boucle
+		h = h * 31 + _wall_own_child_count(path)
+		# Bevel ON/OFF ne change pas les points mais la forme des coins (joint_mode)
+		h = h * 31 + int(line.joint_mode)
 		# Include portal texture state so shadow rebuilds when textures load
 		for ci2 in range(path.get_child_count()):
 			var ch2 = path.get_child(ci2)
@@ -5756,6 +5781,10 @@ func _build_silhouette_strip(line, bulge, radial, closed, bitmap_map = null) -> 
 	# projetée sur les points beveled -> forme arrondie mais motif calé sur le mur (pas de
 	# déphasage cumulé aux coins).
 	var u_map = _raw_arclen_map(pts, raw_pts, closed)
+	# Dungeondraft 1.3 mesh walls: the texture position the wall itself has at each point
+	var native_band = _native_band(line)
+	var native_u_first = 0.0
+	var native_u_last = 0.0
 	var normals = calculate_point_normals(pts, closed)
 	if normals.size() != n:
 		return mesh
@@ -5874,6 +5903,11 @@ func _build_silhouette_strip(line, bulge, radial, closed, bitmap_map = null) -> 
 			uvs.append((pts[i] - nrm * si - bm_o) / bm_c)
 		else:
 			var u = u_map[i] / u_period if i < u_map.size() else cum / u_period
+			if native_band != null:
+				u = native_band.GetTextureU(pts[i])
+				if i == 0:
+					native_u_first = u
+				native_u_last = u
 			# V : bord extérieur (+normale) -> 1, intérieur -> 0 (miroir sinon). Bord
 			# rabattu par la direction -> 0.5 (centre de la texture).
 			var vo = 1.0 if keep_out else 0.5
@@ -5903,6 +5937,9 @@ func _build_silhouette_strip(line, bulge, radial, closed, bitmap_map = null) -> 
 			if raw_pts.size() >= 2:
 				raw_total += raw_pts[raw_pts.size() - 1].distance_to(raw_pts[0])
 			var u0 = raw_total / u_period
+			if native_band != null:
+				# back at the first point: its position, as many whole tiles on as the wall ran
+				u0 = native_u_first + round(native_u_last - native_u_first)
 			var vo0 = 1.0 if keep_out else 0.5
 			var vi0 = 0.0 if keep_in else 0.5
 			uvs.append(Vector2(u0, vo0))
@@ -6127,17 +6164,20 @@ func create_realistic_shadow_wall(path, config: Dictionary, line):
 				pcont.scale = Vector2(gn["scale_f"], gn["scale_f"])
 				pcont.position = -gn["origin"] * gn["scale_f"]
 				pvp.add_child(pcont)
-				var nat = segments[0].duplicate(0)
-				for nc in nat.get_children():
-					nc.free()
-				nat.set("Loop", true)
-				nat.transform = seg_xf[0]
-				nat.default_color = Color(1, 1, 1, 1)
 				var nmat = ShaderMaterial.new()
 				nmat.shader = _get_wall_silhouette_shader()
-				nat.material = nmat
+				# Dungeondraft 1.3 mesh walls: the band as the wall draws it (its corners, its texture)
+				var nat = _native_band_instance(segments[0], segments[0].width, seg_xf[0], nmat)
+				if nat == null:
+					nat = segments[0].duplicate(0)
+					for nc in nat.get_children():
+						nc.free()
+					nat.set("Loop", true)
+					nat.transform = seg_xf[0]
+					nat.default_color = Color(1, 1, 1, 1)
+					nat.material = nmat
 				pcont.add_child(nat)
-				line.add_child(pvp)
+				_wall_r_holder(line).add_child(pvp)
 				yield(global.Editor.get_tree(), "idle_frame")
 				yield(global.Editor.get_tree(), "idle_frame")
 				if _realistic_gen.get(nid, -1) != gen or not is_instance_valid(path) or not is_instance_valid(line) or not is_instance_valid(pvp):
@@ -6166,7 +6206,7 @@ func create_realistic_shadow_wall(path, config: Dictionary, line):
 			int(config.get("direction", ShadowDirection.BOTH)),
 			_wall_crop_reach(blur_px, tex_width), false, Viewport.UPDATE_ONCE, _side_crop, _ends_crop)
 		mvp = mres[0]
-	line.add_child(vp)
+	_wall_r_holder(line).add_child(vp)
 
 	yield(global.Editor.get_tree(), "idle_frame")
 	yield(global.Editor.get_tree(), "idle_frame")
@@ -6190,6 +6230,7 @@ func create_realistic_shadow_wall(path, config: Dictionary, line):
 	if img == null:
 		if _wall_r_capturing.get(nid, -1) == gen:
 			_wall_r_capturing.erase(nid)
+		_drop_wall_r_linger(nid)
 		return
 	img.flip_y()
 	var tex = ImageTexture.new()
@@ -6341,21 +6382,24 @@ func _start_wall_r_session(path, line, shadow_parent, line_global_xform, wall_ni
 		mcont = mres[1]
 		mtex = mvp.get_texture()
 		mtex.flags = Texture.FLAG_FILTER
-	line.add_child(vp)
+	_wall_r_holder(line).add_child(vp)
 	var vtex = vp.get_texture()
 	vtex.flags = Texture.FLAG_FILTER
-	var spr = null
+	# Le viewport tout neuf est encore vide à sa première image : l'ancien sprite reste
+	# affiché et le nouveau, caché, ne le remplace qu'à l'image suivante (sinon flicker).
+	var spr = Sprite.new()
+	var previous = null
 	var old_nodes = path.get_meta(SHADOW_META_KEY) if path.has_meta(SHADOW_META_KEY) else null
 	if old_nodes is Array:
 		for n in old_nodes:
-			if is_instance_valid(n) and (n is Sprite) and spr == null:
-				spr = n
+			if is_instance_valid(n) and (n is Sprite) and previous == null and n.visible:
+				previous = n
 			elif is_instance_valid(n):
 				if n.get_parent() != null:
 					n.get_parent().remove_child(n)
 				n.free()
-	if spr == null:
-		spr = Sprite.new()
+	if previous == null and _wall_r_linger.has(nid) and is_instance_valid(_wall_r_linger[nid]):
+		previous = _wall_r_linger[nid]
 	spr.name = "DropShadowRealistic"
 	spr.texture = vtex
 	spr.centered = true
@@ -6376,7 +6420,15 @@ func _start_wall_r_session(path, line, shadow_parent, line_global_xform, wall_ni
 	if shadow_parent != line and wall_nid != "":
 		spr.set_meta("_ba_wall_id", wall_nid)
 	path.set_meta(SHADOW_META_KEY, [spr])
-	_purge_wall_r_sprites(path, line, nid, spr)
+	if previous != null:
+		spr.visible = false
+		_wall_r_linger[nid] = previous
+		_wall_r_reveal[nid] = [path, spr]
+		var _tree = global.Editor.get_tree()
+		if not _tree.is_connected("idle_frame", self, "_reveal_wall_r_sprites"):
+			_tree.connect("idle_frame", self, "_reveal_wall_r_sprites", [], CONNECT_ONESHOT)
+	else:
+		_purge_wall_r_sprites(path, line, nid, spr)
 	_wall_r_session[nid] = {"vp": vp, "container": container, "sprite": spr, "scale_f": g["scale_f"], "base_pos": g["base_pos"], "tsize": tsize, "parent": shadow_parent, "line": line, "line_xform": line_global_xform, "mvp": mvp, "mcont": mcont}
 	_wall_r_last_req[nid] = OS.get_ticks_msec()
 	_wall_r_live.erase(nid)
@@ -6435,6 +6487,32 @@ func _update_wall_r_session(nid, path, line, radial, offset, shadow_color, opaci
 	_wall_r_last_req[nid] = OS.get_ticks_msec()
 	return true
 
+# Dungeondraft 1.3 (mesh walls): the wall's band is drawn by a child of its Line2D, with its own corners and
+# texture placement, which a clone of the Line2D does not have. Null on older Dungeondraft (the Line2D draws it).
+func _native_band(seg):
+	if seg == null or not is_instance_valid(seg):
+		return null
+	for c in seg.get_children():
+		if c.has_method("GetMesh") and c.has_method("GetTextureU"):
+			return c
+	return null
+
+# The band as the wall draws it, `width` wide (its texture where it is on the wall), to draw with `material`;
+# null if the wall is not a mesh wall.
+func _native_band_instance(seg, width, xf, material):
+	var band = _native_band(seg)
+	if band == null:
+		return null
+	var mesh = band.GetMesh(width)
+	if mesh == null:
+		return null
+	var mi = MeshInstance2D.new()
+	mi.mesh = mesh
+	mi.texture = seg.texture
+	mi.transform = xf
+	mi.material = material
+	return mi
+
 func _populate_wall_r_container(container, path, segments, seg_xf, line_inv, radial, loop_bitmap = null):
 	var seg_closed = is_path_closed(path) and segments.size() == 1
 	var sil = _get_wall_silhouette_shader()
@@ -6459,6 +6537,12 @@ func _populate_wall_r_container(container, path, segments, seg_xf, line_inv, rad
 		if seg_closed:
 			# Boucle (sans radial, ou session) : on DUPLIQUE le Line2D du mur (avec Loop)
 			# -> tiling EXACT comme DD.
+			var lmat_native = ShaderMaterial.new()
+			lmat_native.shader = sil
+			var lband = _native_band_instance(seg2, seg2.width + 2.0 * _realistic_spread_px_cur, seg_xf[si], lmat_native)
+			if lband != null:
+				container.add_child(lband)
+				continue
 			var lclone = seg2.duplicate(0)
 			lclone.width = seg2.width + 2.0 * _realistic_spread_px_cur
 			for lc in lclone.get_children():
@@ -6511,6 +6595,14 @@ func _populate_wall_r_container(container, path, segments, seg_xf, line_inv, rad
 			if end_ext > 0.0:
 				var tb = (cpts[cpts.size() - 1] - cpts[cpts.size() - 2]).normalized()
 				cpts.append(cpts[cpts.size() - 1] + tb * end_ext)
+		if start_ext <= 0.0 and end_ext <= 0.0:
+			var omat_native = ShaderMaterial.new()
+			omat_native.shader = sil
+			var oband = _native_band_instance(seg2, seg2.width + 2.0 * _realistic_spread_px_cur, seg_xf[si], omat_native)
+			if oband != null:
+				clone.free()
+				container.add_child(oband)
+				continue
 		clone.points = cpts
 		# Spread (Blur Control = Spread + Softness): dilate the silhouette ribbon.
 		clone.width = seg2.width + 2.0 * _realistic_spread_px_cur
@@ -7097,6 +7189,7 @@ func _apply_wall_crop_params(mat, mask_tex):
 # Purge EXHAUSTIVE : libère tout sprite realistic appartenant à ce mur (tag _wall_r_owner)
 # où qu'il soit dans l'arbre (line courante, ancienne line, conteneur below-all), sauf `keep`.
 func _purge_wall_r_sprites(path, line, nid, keep):
+	_drop_wall_r_linger(nid)
 	var roots = []
 	if is_instance_valid(path):
 		roots.append(path.get_parent())   # nœud Walls -> couvre toutes les lines (own-wall)
@@ -7128,17 +7221,58 @@ func _apply_wall_r_params(mat, vp_size, blur_px, scale_f, shadow_color, opacity)
 
 # Place le sprite : centré sur base_pos+offset (line-local), échelle 1/scale_f, mappé dans
 # le repère du parent (mur, ou conteneur below-all).
-# Wrapper Node2D (enfant du Line2D, derrière lui) qui contient le sprite d'ombre. Comme
-# "Colour and Modify Things" itère line.get_children() et n'écrase le matériau que des
-# Sprite, notre ombre logée dans ce Node2D est protégée.
+# Wrapper Node2D qui contient le sprite d'ombre. Comme "Colour and Modify Things" n'écrase le
+# matériau que des Sprite, notre ombre logée dans ce Node2D est protégée.
+# Il est enfant du MUR (pas du Line2D) : DD recrée les Line2D à chaque édition du mur, ce qui
+# détruisait l'ombre avec eux -> elle disparaissait jusqu'au re-bake (flicker). Placé juste
+# avant les lignes du mur, au même z qu'elles, il reste dessiné derrière elles.
+# Où loger les viewports de capture d'un mur : dans le MUR, pas dans son Line2D, que DD recrée à
+# chaque édition (le viewport d'une session live, dont le sprite affiche la texture, disparaissait
+# avec lui -> l'ombre aussi, jusqu'au re-bake).
+func _wall_r_holder(line):
+	return line.get_parent() if line.get_parent() is Node2D else line
+
+var _wall_r_reveal = {}   # instance_id du mur -> [mur, sprite] à montrer à l'image suivante
+
+func _reveal_wall_r_sprites():
+	var pending = _wall_r_reveal
+	_wall_r_reveal = {}
+	for nid in pending:
+		_reveal_wall_r_sprite(pending[nid][0], nid, pending[nid][1])
+
+# Montre le sprite d'une session live une image après sa création (son viewport a dessiné), et
+# retire alors l'ancien.
+func _reveal_wall_r_sprite(path, nid, spr):
+	if not is_instance_valid(spr):
+		return
+	# remplacé entre-temps par une autre session : celui-ci ne sert plus
+	if _wall_r_session.has(nid) and _wall_r_session[nid]["sprite"] != spr:
+		if spr.get_parent() != null:
+			spr.get_parent().remove_child(spr)
+		spr.free()
+		return
+	spr.visible = true
+	if is_instance_valid(path):
+		_purge_wall_r_sprites(path, get_line2d(path), nid, spr)
+	else:
+		_drop_wall_r_linger(nid)
+
 func _get_wall_r_wrapper(line):
-	for c in line.get_children():
+	var holder = line.get_parent() if line.get_parent() is Node2D else line
+	for c in holder.get_children():
 		if (c is Node2D) and not (c is Sprite) and str(c.name) == "DropShadowRealisticWrap":
+			if holder != line:
+				c.z_index = line.z_index
 			return c
 	var w = Node2D.new()
 	w.name = "DropShadowRealisticWrap"
-	w.show_behind_parent = true
-	line.add_child(w)
+	holder.add_child(w)
+	if holder != line:
+		w.z_index = line.z_index
+		# juste avant les lignes du mur (les nouvelles lignes s'ajoutent après)
+		holder.move_child(w, line.get_index())
+	else:
+		w.show_behind_parent = true
 	return w
 
 func _place_wall_r_sprite(spr, shadow_parent, line, line_global_xform, base_pos, offset, scale_f):
@@ -7322,7 +7456,11 @@ func create_shadow(path, config: Dictionary):
 	# Line2D children are split around portals by Dungeondraft, so merging them
 	# misses extremities when a portal sits at the start or end of the wall.
 	var full_line = PoolVector2Array()
-	var wall_points = path.get("Points")
+	# Dungeondraft 1.3 : la ligne le long de laquelle le mur est DESSINÉ (Grid Offset le décale à
+	# côté de ses points) ; absente avant -> Points.
+	var wall_points = path.get("DrawnLine")
+	if wall_points == null:
+		wall_points = path.get("Points")
 	if wall_points != null and wall_points.size() >= 2:
 		for wp in wall_points:
 			full_line.append(wp)
@@ -7882,6 +8020,26 @@ func create_shadow(path, config: Dictionary):
 	_apply_custom_layer_z(path, config)
 	outputlog("Shadow created with " + str(shadow_nodes.size()) + " mesh(es)", 1)
 
+# Ombres realistic gardées affichées après remove_shadow, en attendant leur remplaçante.
+var _wall_r_linger = {}   # instance_id du mur -> Sprite
+
+# Fin de frame : si aucune capture n'a été lancée pour ce mur (ombre désactivée, passée en
+# simple...), l'ancienne ombre s'en va. Sinon la capture la purgera en posant la nouvelle.
+func _drop_wall_r_linger_if_idle(nid):
+	if _wall_r_capturing.has(nid):
+		return
+	_drop_wall_r_linger(nid)
+
+func _drop_wall_r_linger(nid):
+	if not _wall_r_linger.has(nid):
+		return
+	var s = _wall_r_linger[nid]
+	_wall_r_linger.erase(nid)
+	if is_instance_valid(s):
+		if s.get_parent() != null:
+			s.get_parent().remove_child(s)
+		s.free()
+
 func remove_shadow(path):
 	if path == null or not is_instance_valid(path):
 		return
@@ -7904,9 +8062,16 @@ func remove_shadow(path):
 		if nodes is Array:
 			for node in nodes:
 				if is_instance_valid(node):
+					# Ombre realistic : gardée affichée jusqu'à ce que la nouvelle capture la
+					# remplace (_purge_wall_r_sprites), au lieu d'un trou de quelques frames (flicker).
+					if (node is Sprite) and node.has_meta("_wall_r_owner"):
+						_wall_r_linger[_rnid] = node
+						continue
 					node.get_parent().remove_child(node)
 					node.free()
 		path.remove_meta(SHADOW_META_KEY)
+	if _wall_r_linger.has(_rnid):
+		call_deferred("_drop_wall_r_linger_if_idle", _rnid)
 
 #########################################################################################################
 ##

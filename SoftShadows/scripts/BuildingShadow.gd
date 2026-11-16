@@ -11,6 +11,11 @@
 # native pattern tools and compatible with third-party pattern effects (blur).
 #
 # Geometry engine: region_geometry.gd (copied from the Unofficial Patch).
+#
+# Roofs made with the Roof Builder for Patterns mod (when it is running) are
+# buildings too: that mod renders their visible pixels and returns the
+# outline, merged here with the walls' silhouette. Its Global Lighting can
+# also be linked to this tool (roofs lit from the sun of the dial).
 
 var script_class = "tool"
 
@@ -18,7 +23,7 @@ var global
 var core
 var logging_level = 0
 
-const BUILD = "BUILDSHADOW-65"
+const BUILD = "BUILDSHADOW-68"
 const META_KEY = "SoftShadowsBuildingShadowListener"
 
 # Default appearance / placement
@@ -36,6 +41,12 @@ const SEAM_DEBUG := false           # dump applied rings to user://bs_seam_debug
 const BS_TEX_KEY := "BuildingShadowTex"  # ModMapData: {node_id(str): opacity_pct} — mirrored in ShadowToggle.BS_PATTERN_KEY
 const SHADOW_TOGGLE_KEY := "DropShadowToggleHidden"  # ShadowToggle's global state
 const MIN_RING_AREA = 400.0         # px²: cleanup fragments below this are culled instead of becoming micro-patterns
+const ROOF_API_META = "RoofBuilderForPatterns"  # Engine meta: WeakRef to Roof Builder for Patterns
+const ROOF_INSET = 3.0              # px: roof outlines are shrunk so the shadow starts under the roof edge
+const ROOF_SMOOTH = 10.0            # px: tile scallops narrower than twice this are smoothed off roof outlines
+const ROOF_WALL_COVER = 0.15        # clicked roof: walls kept when the roofs cover this share of their outline
+const ROOF_SKIP_META = "roof_builder_skip"  # node meta: Roof Builder never turns the shape into a roof
+const ROOF_WAIT_FRAMES = 30         # frames a pick waits for Roof Builder's roof outlines
 
 var _geo = null                     # region_geometry instance
 var _tool_injected := false
@@ -102,6 +113,15 @@ var _last_extrude_ms := 0
 var _hover_line = null
 var _hover_key := ""
 var _uchideshi = null               # EdgeBlurPatterns instance (uchideshi's mod), if detected
+var _cb_roofs = null                # "Roofs" building border (only while Roof Builder runs)
+var _light_row = null               # Global Lighting link (only while Roof Builder runs)
+var _btn_roof_light = null
+var _light_syncing := false
+var _roof_pending := false          # last silhouette computation waits for Roof Builder
+var _roof_wait := false             # a pick is waiting for Roof Builder (clicks swallowed)
+var _hl_roof_rev := -1              # Roof Builder revision the highlight cache belongs to
+var _wall_memo_key := ""            # last wall silhouette computation (same click asked again)
+var _wall_memo = []
 
 # Shadow offset vector (shadow displacement in px, same convention as the
 # other modules: the dial handle points at the SUN, the offset is opposite)
@@ -219,6 +239,9 @@ func on_update(_delta):
 	var tool_now = _is_pattern_tool_active()
 	if _was_tool_active and not tool_now and _active:
 		_maybe_prompt_pending()
+	# Back in the tool: the roofs' light may have been changed in Roof Builder
+	if tool_now and not _was_tool_active and _active:
+		_pull_roof_light()
 	_was_tool_active = tool_now
 
 	# Preview housekeeping (also when inactive, e.g. after tool switch)
@@ -261,6 +284,8 @@ func on_update(_delta):
 
 	if not _active:
 		return
+
+	_update_roof_options()
 
 	# Edit Points runs INSIDE our mode: our UI stays, and while it is pressed
 	# we simply step aside (no click interception, no cursor override, no
@@ -380,11 +405,19 @@ func _build_options_box(align):
 	help.add_color_override("font_color", Color(0.75, 0.75, 0.75, 1.0))
 	_opts_box.add_child(help)
 
-	# Barrier types (same idea as the bucket's "Stopped by" row)
-	var bar_row = HBoxContainer.new()
+	# Barrier types (same idea as the bucket's "Stopped by" row): label on
+	# its own line, the choices below it. Roofs only shows while the Roof
+	# Builder for Patterns mod is running.
+	var bar_box = VBoxContainer.new()
+	bar_box.add_constant_override("separation", -2)
 	var lbl_b = Label.new()
 	lbl_b.text = "Building Borders:"
-	bar_row.add_child(lbl_b)
+	bar_box.add_child(lbl_b)
+	var bar_margin = MarginContainer.new()
+	bar_margin.add_constant_override("margin_left", 8)
+	var bar_row = HBoxContainer.new()
+	bar_row.add_constant_override("separation", 10)
+	bar_margin.add_child(bar_row)
 	_cb_walls = CheckBox.new()
 	_cb_walls.text = "Walls"
 	_cb_walls.pressed = true
@@ -395,7 +428,15 @@ func _build_options_box(align):
 	_cb_paths.pressed = false
 	_cb_paths.connect("toggled", self, "_on_barrier_toggled")
 	bar_row.add_child(_cb_paths)
-	_opts_box.add_child(bar_row)
+	_cb_roofs = CheckBox.new()
+	_cb_roofs.text = "Roofs"
+	_cb_roofs.pressed = true
+	_cb_roofs.visible = false
+	_cb_roofs.hint_tooltip = "Roofs made with the Roof Builder for Patterns mod cast the shadow too: their visible pixels are used (not the drawn shape), overlapping roofs are taken together and merged with the walls under them.\nA roof standing in a much larger walled area (town, courtyard) is taken alone.\nNot used in Invert mode."
+	_cb_roofs.connect("toggled", self, "_on_barrier_toggled")
+	bar_row.add_child(_cb_roofs)
+	bar_box.add_child(bar_margin)
+	_opts_box.add_child(bar_box)
 
 	# ── Offset dial (same system as the other shadow tools: handle = sun
 	# position, shadow goes the opposite way; quadratic magnitude mapping;
@@ -440,6 +481,29 @@ func _build_options_box(align):
 	_sl_range = _add_slider_row(_opts_box, "Max Distance", 32.0, 2048.0, 1.0, DEFAULT_RANGE, "px")
 	_sl_opacity = _add_slider_row(_opts_box, "Opacity", 0.0, 100.0, 1.0, DEFAULT_OPACITY, "%")
 	_sl_layer = _add_slider_row(_opts_box, "Layer", -500.0, 900.0, 1.0, float(DEFAULT_LAYER), "")
+
+	# Global Lighting (only shown while Roof Builder for Patterns runs): the
+	# very same setting as Roof Builder's own Global Lighting. On, the roofs
+	# are lit from the sun of the dial (their shading strength is left alone);
+	# a light direction changed in Roof Builder comes back into this tool.
+	_light_row = HBoxContainer.new()
+	_light_row.visible = false
+	var lbl_light = Label.new()
+	lbl_light.text = "Global Lighting"
+	lbl_light.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_light_row.add_child(lbl_light)
+	var lbl_light_note = Label.new()
+	lbl_light_note.text = "(roofs)"
+	lbl_light_note.add_color_override("font_color", Color(0.65, 0.65, 0.65, 1.0))
+	lbl_light_note.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	lbl_light_note.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_light_row.add_child(lbl_light_note)
+	_btn_roof_light = CheckButton.new()
+	_btn_roof_light.hint_tooltip = "Same setting as Global Lighting in Roof Builder (Select Tool): every roof made with Roof Builder is lit from the sun of the dial.\nThe shading strength of the roofs is not changed.\nA light direction changed in Roof Builder sets this tool's direction the next time it is opened."
+	_btn_roof_light.size_flags_horizontal = Control.SIZE_SHRINK_END
+	_btn_roof_light.connect("toggled", self, "_on_roof_light_toggled")
+	_light_row.add_child(_btn_roof_light)
+	_opts_box.add_child(_light_row)
 
 	# Ridge: every flat wall facing the shadow gets a midpoint "roof peak"
 	# projected further out, turning its shadow front into a gable triangle.
@@ -709,6 +773,8 @@ func _set_active(active: bool):
 			_detect_uchideshi()
 		if _blur_row != null and is_instance_valid(_blur_row):
 			_blur_row.visible = _uchideshi != null
+		_update_roof_options()
+		_pull_roof_light()
 		_hide_panel_extras()
 		# Behave like a shape mode: release every other mode in the row
 		# (native shapes AND injected buttons like the bucket) + EditPoints.
@@ -787,7 +853,7 @@ func _edit_points_active() -> bool:
 
 func _on_input(event) -> bool:
 	if not _active: return false
-	if _busy: return false
+	if _busy and not _roof_wait: return false
 	if _popup_pending: return false
 	if not _world_ready(): return false
 	if _edit_points_active(): return false
@@ -801,6 +867,11 @@ func _on_input(event) -> bool:
 	if _is_over_gui(event.position):
 		outputlog("click ignored (over HUD: %s)" % _last_hit_desc, 1)
 		return false
+
+	# A pick is waiting for the roofs' outlines (Roof Builder renders them
+	# over a few frames): canvas clicks are swallowed meanwhile.
+	if _busy:
+		return true
 
 	var world_ui = _get_world_ui()
 	if world_ui == null: return false
@@ -840,7 +911,26 @@ func _do_pick_building(mouse_world: Vector2):
 	_last_click_world = mouse_world
 	_has_last_click = true
 	var t0 = OS.get_ticks_msec()
+	var level = _get_current_level()
 	var sils = _compute_silhouettes(mouse_world)
+	# Roofs: Roof Builder renders their visible pixels over the next frames —
+	# wait for them (clicks are swallowed meanwhile, see _on_input).
+	var waited = 0
+	while _roof_pending:
+		if waited >= ROOF_WAIT_FRAMES:
+			outputlog("Roof Builder did not send the roof outlines in time — click again", 0)
+			_roof_wait = false
+			_busy = false
+			return
+		_roof_wait = true
+		yield(global.Editor.get_tree(), "idle_frame")
+		waited += 1
+		if not _active or not _world_ready() or _get_current_level() != level:
+			_roof_wait = false
+			_busy = false
+			return
+		sils = _compute_silhouettes(mouse_world)
+	_roof_wait = false
 	if sils.size() == 0:
 		_busy = false
 		return
@@ -853,16 +943,72 @@ func _do_pick_building(mouse_world: Vector2):
 	_busy = false
 
 
-# Steps 1-6 of the pipeline: from a click position to the cleaned, filled
-# building silhouette ring(s).
+# From a click position to the cleaned, filled building silhouette ring(s):
+# walls/paths (steps 1-6 below) merged with the outline of the visible pixels
+# of the Roof Builder roofs there (and of those overlapping the walls). A
+# click on a roof standing inside a larger enclosure (walled town, courtyard)
+# picks the roof alone. While Roof Builder is still rendering those roofs,
+# sets _roof_pending and returns [] — ask again on a later frame.
 func _compute_silhouettes(mouse_world: Vector2, quiet: bool = false) -> Array:
+	_roof_pending = false
 	var use_walls = _cb_walls.pressed if (_cb_walls != null and is_instance_valid(_cb_walls)) else true
 	var use_paths = _cb_paths.pressed if (_cb_paths != null and is_instance_valid(_cb_paths)) else false
-	if not use_walls and not use_paths:
+	var use_roofs = _roofs_on() and not _invert_on()
+	if not use_walls and not use_paths and not use_roofs:
 		if not quiet:
-			outputlog("Enable at least one barrier type (Walls / Paths)", 0)
+			outputlog("Enable at least one building border type (Walls / Paths%s)" % (" / Roofs" if _roof_api() != null else ""), 0)
 		return []
+	var sils = []
+	if use_walls or use_paths:
+		sils = _compute_wall_silhouettes(mouse_world, use_walls, use_paths, quiet or use_roofs)
+	if not use_roofs:
+		return sils
+	var roof_sils = _roof_silhouettes(mouse_world, [])
+	if roof_sils == null:
+		_roof_pending = true
+		return []
+	if roof_sils.size() > 0 and sils.size() > 0 and not _walls_under_roofs(sils, roof_sils):
+		sils = []
+	if sils.size() > 0:
+		# The roofs on these walls too
+		roof_sils = _roof_silhouettes(mouse_world, sils)
+		if roof_sils == null:
+			_roof_pending = true
+			return []
+	if roof_sils.size() == 0:
+		if sils.size() == 0 and not quiet:
+			outputlog("No building at click position (no enclosed region, no roof)", 0)
+		return sils
+	if sils.size() == 0:
+		return roof_sils
+	# Building = its wall silhouette(s) + its roofs
+	var comps = []
+	for ring in sils + roof_sils:
+		comps.append(_geo._solid_to_comp({"outer": ring, "holes": []}))
+	comps = _geo._union_components(comps)
+	if comps == null:
+		return sils
+	var out = []
+	for c in comps:
+		var sil = _clean_ring_basic(_geo._ensure_ccw(c.outer))
+		if sil.size() >= 3:
+			out.append(sil)
+	return out
 
+
+# Wall/path silhouettes, remembered for the last click (a pick waiting for
+# Roof Builder asks again at the same position on the next frames).
+func _compute_wall_silhouettes(mouse_world: Vector2, use_walls: bool, use_paths: bool, quiet: bool) -> Array:
+	var key = "%s|%s|%s|%s|%d" % [str(mouse_world), str(use_walls), str(use_paths), str(_invert_on()), _level_uid()]
+	if key != _wall_memo_key:
+		_wall_memo = _compute_wall_silhouettes_now(mouse_world, use_walls, use_paths, quiet)
+		_wall_memo_key = key
+	return _wall_memo.duplicate()
+
+
+# Steps 1-6 of the pipeline: from a click position to the cleaned, filled
+# silhouette ring(s) of the building bounded by walls/paths.
+func _compute_wall_silhouettes_now(mouse_world: Vector2, use_walls: bool, use_paths: bool, quiet: bool) -> Array:
 	# 1) Clicked room. Validates the click is inside an enclosure.
 	var room = _geo.compute_region(mouse_world, use_walls, use_paths, false)
 	if room == null or room.outer.size() < 3:
@@ -1728,6 +1874,10 @@ func _draw_shadow_pattern(pts: Array):
 			md[BS_TEX_KEY] = {}
 		md[BS_TEX_KEY][str(node_id)] = int(clamp(_sl_opacity.value, 0, 100))
 	var new_shape = global.World.GetNodeByID(node_id)
+	# Never a roof for Roof Builder for Patterns (with its Pattern Tool option
+	# on, it would turn every new pattern shape into a roof)
+	if new_shape != null:
+		new_shape.set_meta(ROOF_SKIP_META, true)
 	# Respect the global Shadows toggle: a pattern created while shadows are
 	# hidden is born hidden, consistent with every other shadow
 	if new_shape != null and md is Dictionary and md.get(SHADOW_TOGGLE_KEY, false):
@@ -2036,6 +2186,7 @@ func _set_offset(v: Vector2):
 	_offset = v
 	_update_dial_handle()
 	_pv_dirty = true
+	_push_roof_light()
 
 
 func _update_dial_handle():
@@ -2192,8 +2343,8 @@ func _on_barrier_toggled(_pressed):
 	_reset_building_highlight_cache()
 	if _cb_walls == null or _cb_paths == null:
 		return
-	if not _cb_walls.pressed and not _cb_paths.pressed:
-		outputlog("At least one barrier type should be enabled (Walls / Paths)", 0)
+	if not _cb_walls.pressed and not _cb_paths.pressed and not _roofs_on():
+		outputlog("At least one building border type should be enabled (Walls / Paths%s)" % (" / Roofs" if _roof_api() != null else ""), 0)
 		return
 	if _pv_sils.size() > 0 and _has_last_click and not _busy:
 		_do_pick_building(_last_click_world)
@@ -2229,6 +2380,158 @@ func _restore_panel_extras():
 		if is_instance_valid(item):
 			item.visible = true
 	_hidden_panel_items = []
+
+
+#########################################################################################################
+##
+## ROOF BUILDER FOR PATTERNS INTEGRATION
+##
+#########################################################################################################
+
+# Roof Builder for Patterns, when it is running (it registers a WeakRef to
+# itself in Engine meta); null otherwise.
+func _roof_api():
+	if not Engine.has_meta(ROOF_API_META):
+		return null
+	var ref = Engine.get_meta(ROOF_API_META)
+	if not (ref is WeakRef):
+		return null
+	var api = ref.get_ref()
+	if api == null or not api.has_method("roof_outlines_at") or not api.has_method("roof_api_alive"):
+		return null
+	if not api.roof_api_alive():
+		return null
+	return api
+
+
+func _roofs_on() -> bool:
+	return _cb_roofs != null and is_instance_valid(_cb_roofs) and _cb_roofs.pressed \
+			and _roof_api() != null
+
+
+# The Roof Builder options only exist while Roof Builder for Patterns runs
+func _update_roof_options():
+	var api = _roof_api()
+	if _cb_roofs != null and is_instance_valid(_cb_roofs) and _cb_roofs.visible != (api != null):
+		_cb_roofs.visible = api != null
+	var show_light = api != null and api.has_method("roof_global_light")
+	if _light_row != null and is_instance_valid(_light_row) and _light_row.visible != show_light:
+		_light_row.visible = show_light
+
+
+# Global Lighting toggle = Roof Builder's own Global Lighting. Turned on here,
+# the roofs take this tool's light direction.
+func _on_roof_light_toggled(pressed):
+	if _light_syncing:
+		return
+	var api = _roof_api()
+	if api == null or not api.has_method("roof_set_global_light"):
+		return
+	if pressed:
+		api.roof_set_global_light(_roof_light_fields())
+	else:
+		api.roof_set_global_light({"on": false})
+
+
+# The roofs' light from this tool: it comes from the sun of the dial (the
+# shadow goes the other way; Roof Builder angles: 0 = top, clockwise). The
+# shading strength is never sent: it stays Roof Builder's.
+func _roof_light_fields() -> Dictionary:
+	var f = {"on": true}
+	if _offset.length() >= 0.5:
+		f["light"] = fposmod(rad2deg(_offset.angle()) - 90.0, 360.0)
+	return f
+
+
+# Dial changed: the roofs follow while Global Lighting is on.
+func _push_roof_light():
+	if _light_syncing or _btn_roof_light == null or not is_instance_valid(_btn_roof_light) \
+			or not _btn_roof_light.pressed or not _light_row.visible:
+		return
+	var api = _roof_api()
+	if api == null or not api.has_method("roof_set_global_light"):
+		return
+	api.roof_set_global_light(_roof_light_fields())
+
+
+# Opening the tool: the toggle shows Roof Builder's Global Lighting and, when
+# it is on, the dial takes the roofs' light direction (it may have been
+# changed in Roof Builder meanwhile). Nothing is sent back meanwhile.
+func _pull_roof_light():
+	var api = _roof_api()
+	if api == null or not api.has_method("roof_global_light") \
+			or _btn_roof_light == null or not is_instance_valid(_btn_roof_light):
+		return
+	var gl = api.roof_global_light()
+	var on = bool(gl.get("on", false))
+	_light_syncing = true
+	if _btn_roof_light.pressed != on:
+		_btn_roof_light.pressed = on
+	if on:
+		var want = fposmod(float(gl.get("light", 315.0)) + 90.0, 360.0)
+		var cur = rad2deg(_offset.angle()) if _offset.length() >= 0.5 else want + 180.0
+		if abs(fposmod(want - cur + 180.0, 360.0) - 180.0) > 0.5:
+			# A pressed snap point would no longer match the direction
+			for key in _snap_buttons.keys():
+				if _snap_buttons[key].pressed:
+					_snap_buttons[key].pressed = false
+			var d = _offset.length() if _offset.length() >= 0.5 else DEFAULT_DISTANCE
+			_set_offset(Vector2(cos(deg2rad(want)), sin(deg2rad(want))) * d)
+	_light_syncing = false
+
+
+# True when the roofs cover a good part of the walls' silhouette(s): the walls
+# then belong to the roofed building — unlike a roof standing somewhere in a
+# larger enclosure (walled town, courtyard), which is a building of its own.
+func _walls_under_roofs(wall_sils: Array, roof_sils: Array) -> bool:
+	var total = 0.0
+	var covered = 0.0
+	for w in wall_sils:
+		total += _geo._polygon_area(w)
+		for r in roof_sils:
+			for piece in Geometry.intersect_polygons_2d(PoolVector2Array(w), PoolVector2Array(r)):
+				if piece.size() >= 3 and not Geometry.is_polygon_clockwise(piece):
+					covered += _geo._polygon_area(_geo._to_array(piece))
+	return total > 0.0 and covered >= total * ROOF_WALL_COVER
+
+
+# Changes whenever a Roof Builder roof changes (-1: roofs not used)
+func _roof_revision() -> int:
+	if not _roofs_on():
+		return -1
+	var api = _roof_api()
+	return int(api.roof_api_revision()) if api.has_method("roof_api_revision") else 0
+
+
+# Outlines of the visible pixels of the Roof Builder roofs at the click
+# (overlapping roofs together) and of those overlapping the walls'
+# silhouette(s), shrunk so the shadow starts under the roof edges.
+# [] when there is none, null while Roof Builder is still rendering them.
+func _roof_silhouettes(mouse_world: Vector2, wall_sils: Array):
+	var api = _roof_api()
+	if api == null:
+		return []
+	# Shrunk by ROOF_INSET + ROOF_SMOOTH, then grown back by ROOF_SMOOTH: the
+	# small tile scallops of the eaves are smoothed off (fewer points, lighter
+	# extrusion) without ever growing past the visible pixels.
+	var outlines = api.roof_outlines_at(mouse_world, wall_sils, ROOF_INSET + ROOF_SMOOTH)
+	if outlines == null:
+		return null
+	var comps = []
+	for ring in outlines:
+		for piece in Geometry.offset_polygon_2d(PoolVector2Array(ring), ROOF_SMOOTH, Geometry.JOIN_MITER):
+			if piece.size() >= 3 and not Geometry.is_polygon_clockwise(piece):
+				comps.append(_geo._solid_to_comp({"outer": _geo._to_array(piece), "holes": []}))
+	if comps.size() > 1:
+		comps = _geo._union_components(comps)
+		if comps == null:
+			return []
+	var out = []
+	for c in comps:
+		var sil = _clean_ring_basic(_geo._ensure_ccw(c.outer))
+		if sil.size() >= 3 and _geo._polygon_area(sil) >= MIN_RING_AREA:
+			out.append(sil)
+	return out
 
 
 #########################################################################################################
@@ -2444,6 +2747,14 @@ func _update_building_highlight():
 	var vp = world_ui.get_viewport()
 	var mouse = vp.get_canvas_transform().affine_inverse().xform(vp.get_mouse_position())
 
+	# Roofs changed (Roof Builder): the cached buildings may be outdated
+	var rev = _roof_revision()
+	if rev != _hl_roof_rev:
+		_hl_roof_rev = rev
+		_clear_building_highlight()
+		_hl_cache = []
+		_hl_fails = []
+
 	# Still inside the currently highlighted building → nothing to do
 	if _hl_sils.size() > 0:
 		for sil in _hl_sils:
@@ -2467,6 +2778,11 @@ func _update_building_highlight():
 	_hl_last_try = OS.get_ticks_msec()
 
 	var sils = _compute_silhouettes(mouse, true)
+	if _roof_pending:
+		# Roof Builder is still rendering the roofs here: try again on a
+		# later frame (not a failure — nothing is remembered).
+		_clear_building_highlight()
+		return
 	if sils.size() == 0:
 		_hl_fails.append(mouse)
 		if _hl_fails.size() > HL_FAILS_MAX:
@@ -2510,6 +2826,8 @@ func _reset_building_highlight_cache():
 	_hl_fails = []
 	_solids_cache = null
 	_solids_cache_key = ""
+	_wall_memo_key = ""
+	_wall_memo = []
 
 
 func _free_hl_node():
