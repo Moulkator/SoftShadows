@@ -1,9 +1,16 @@
 SOFT SHADOWS
 
+v1.7.6
+- Fixed realistic wall shadows flickering when a setting is changed or the wall is edited
+- Fixed realistic wall shadows not following the wall while moving a point with Edit Points
+- Fixed realistic wall shadows not updating when Bevel is turned on or off
+- Added support for the Roof Builder for Patterns mod in the Building Shadow Tool (Patterns Tool)
+- Added support for the new wall drawing of Dungeondraft 1.3.0.0
+
 v1.7.5
 - Added a better multi-type selection support
 - Added the ability to choose only one of the ends with the Wrap Ends option (walls and paths in realistic mode)
-- Added "Crop at Center" by default for walls and paths in Realistic Mod (one side only)
+- Added "Crop at Center" by default for walls and paths in Realistic Mode (one side only)
 - Fixed "blocked by" feature not working in Bake rendering
 - Fixed incorrect angle in Projected Mode (objects)
 
